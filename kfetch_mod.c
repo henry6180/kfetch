@@ -6,16 +6,16 @@
 #include <linux/cdev.h>
 #include <linux/device.h> //used for struct class
 #include <linux/atomic.h>
-#include <linux/uaccess.h> //copy_to_user(), copy_from_user
-#include <linux/utsname.h> //get the hostname and the release version
-#include <linux/cpumask.h> //num_possible_cpus(), num_online_cpus()
-#include <linux/cpu.h>     //cpu_data()
-#include <linux/mm.h>      //si_meminfo()
-#include <linux/time_namespace.h>   //uptime
+#include <linux/uaccess.h>        //copy_to_user(), copy_from_user
+#include <linux/utsname.h>        //get the hostname and the release version
+#include <linux/cpumask.h>        //num_possible_cpus(), num_online_cpus()
+#include <linux/cpu.h>            //cpu_data()
+#include <linux/mm.h>             //si_meminfo()
+#include <linux/time_namespace.h> //uptime
 #include <linux/sched.h>
 
 #define KFETCH_DEV_NAME "kfetch"
-#define KFETCH_BUF_SIZE 1024
+#define KFETCH_BUF_SIZE 2048
 #define KFETCH_INFO_SIZE 128
 #define KFETCH_DEV_NUM 1
 #define CLOSED 0
@@ -28,20 +28,21 @@
 static dev_t dev;
 static struct cdev kfetch_cdev;
 static struct class *kfetch_cls;
-static char *kfetch_buf;
 static atomic_t is_open = ATOMIC_INIT(CLOSED);
 static int mask;
-static char logo[7][32] = {"         .-.        ",
-                           "        (.. |       ",
-                           "        <>  |       ",
-                           "       / --- \\      ",
-                           "      ( |   | |     ",
-                           "    |\\\\_)___/\\)/\\   ",
-                           "   <__)------(__/   "};
-static size_t logo_len = 20;
+static char logo[7][64] = {LOGO_COLOR "         .-.        " RESET_COLOR,
+                           LOGO_COLOR "        (.. |       " RESET_COLOR,
+                           LOGO_COLOR "        <>  |       " RESET_COLOR,
+                           LOGO_COLOR "       / --- \\      " RESET_COLOR,
+                           LOGO_COLOR "      ( |   | |     " RESET_COLOR,
+                           LOGO_COLOR "    |\\\\_)___/\\)/\\   " RESET_COLOR,
+                           LOGO_COLOR "   <__)------(__/   " RESET_COLOR};
+static size_t logo_width = 20;
 
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
+static ssize_t kfetch_read_system_info(char *, size_t);
+static ssize_t kfetch_read_power_info(char *, size_t);
 static int kfetch_open(struct inode *, struct file *);
 static int kfetch_release(struct inode *, struct file *);
 const static struct file_operations kfetch_ops = {
@@ -80,26 +81,15 @@ static void __exit kfetch_exit(void)
     pr_info("Leave kfetch_mod\n");
 }
 
-static ssize_t kfetch_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
+static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
 {
-    if (*offset > 0)
-    {
-        return 0;
-    }
     ssize_t ret = 0;
     char *infos[7] = {NULL};
     size_t curr_info = 0;
-    kfetch_buf = kmalloc(KFETCH_BUF_SIZE * sizeof(char), GFP_KERNEL);
-    if (kfetch_buf == NULL)
-    {
-        ret = -1;
-        goto cleanup;
-    }
 
-    // Get host name
     char *hostname = utsname()->nodename;
-    snprintf(kfetch_buf, KFETCH_BUF_SIZE,
-             "%*c" TITLE_COLOR "%s" RESET_COLOR "\n", (int)logo_len, ' ', hostname);
+    snprintf(buffer, buffer_size,
+             "%*c" TITLE_COLOR "%s" RESET_COLOR "\n", (int)logo_width, ' ', hostname);
 
     // Seperate line
     infos[curr_info] = kmalloc(KFETCH_INFO_SIZE * sizeof(char), GFP_KERNEL);
@@ -215,34 +205,74 @@ static ssize_t kfetch_read(struct file *filp, char __user *buffer, size_t length
 
     for (int i = 0; i < 7; i++)
     {
-        strncat(kfetch_buf, LOGO_COLOR, KFETCH_BUF_SIZE - strlen(kfetch_buf) - 1);
-        strncat(kfetch_buf, logo[i], KFETCH_BUF_SIZE - strlen(kfetch_buf) - 1);
-        strncat(kfetch_buf, RESET_COLOR, KFETCH_BUF_SIZE - strlen(kfetch_buf) - 1);
+        strncat(buffer, logo[i], buffer_size - strlen(buffer) - 1);
         if (infos[i] != NULL)
         {
-            strncat(kfetch_buf, infos[i], KFETCH_BUF_SIZE - strlen(kfetch_buf) - 1);
+            strncat(buffer, infos[i], buffer_size - strlen(buffer) - 1);
         }
-        strncat(kfetch_buf, "\n", KFETCH_BUF_SIZE - strlen(kfetch_buf) - 1);
+        strncat(buffer, "\n", buffer_size - strlen(buffer) - 1);
     }
+    ret = strlen(buffer);
 
-    ret = strlen(kfetch_buf);
-    *offset = ret;
-    if (copy_to_user(buffer, kfetch_buf, ret))
-    {
-        pr_alert("Failed to copy data to user");
-        ret = -1;
-    }
-
-    /* cleaning up */
 cleanup:
-    kfree(kfetch_buf);
-    kfetch_buf = NULL;
     for (int i = 0; i < 7; i++)
     {
         if (infos[i] != NULL)
         {
             kfree(infos[i]);
         }
+    }
+    return ret;
+}
+
+static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
+{
+    return 0;
+}
+
+static ssize_t kfetch_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
+{
+    if (*offset > 0)
+    {
+        return 0;
+    }
+    ssize_t ret = 0;
+    char *kfetch_buf = kmalloc(KFETCH_BUF_SIZE * sizeof(char), GFP_KERNEL);
+    if (kfetch_buf == NULL)
+    {
+        ret = -1;
+        goto cleanup;
+    }
+
+    if (kfetch_read_system_info(kfetch_buf, KFETCH_BUF_SIZE) < 0)
+    {
+        ret = -1;
+        goto cleanup;
+    }
+
+    ret = strlen(kfetch_buf);
+    if (kfetch_read_power_info(kfetch_buf + ret, KFETCH_BUF_SIZE - ret) < 0)
+    {
+        ret = -1;
+        goto cleanup;
+    }
+
+    ret = strlen(kfetch_buf);
+    if (copy_to_user(buffer, kfetch_buf, ret))
+    {
+        pr_alert("Failed to copy data to user");
+        ret = -1;
+        goto cleanup;
+    }
+
+    /* cleaning up */
+cleanup:
+    kfree(kfetch_buf);
+    kfetch_buf = NULL;
+
+    if (ret >= 0)
+    {
+        *offset += ret;
     }
     return ret;
 }
