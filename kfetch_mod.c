@@ -14,21 +14,27 @@
 #include <linux/time_namespace.h> //uptime
 #include <linux/sched.h>
 
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <asm/cpu_device_id.h>
+#include <linux/mutex.h>
+
 #define KFETCH_DEV_NAME "kfetch"
 #define KFETCH_BUF_SIZE 2048
 #define KFETCH_INFO_SIZE 128
+#define KFETCH_LOGO_WIDTH 20
 #define KFETCH_DEV_NUM 1
 #define CLOSED 0
 #define OPENING 1
+
+#define MSR_RAPL_POWER_UNIT_AMD 0xC0010299
+#define MSR_CORE_ENERGY_STATUS 0xC001029A
+#define MSR_PACKAGE_ENERGY_STATUS 0xC001029B
 
 #define TITLE_COLOR "\033[0;33;1m"
 #define LOGO_COLOR "\033[;38;5;214;1m"
 #define RESET_COLOR "\033[0m"
 
-static dev_t dev;
-static struct cdev kfetch_cdev;
-static struct class *kfetch_cls;
-static atomic_t is_open = ATOMIC_INIT(CLOSED);
 static int mask;
 static char logo[7][64] = {LOGO_COLOR "         .-.        " RESET_COLOR,
                            LOGO_COLOR "        (.. |       " RESET_COLOR,
@@ -37,14 +43,32 @@ static char logo[7][64] = {LOGO_COLOR "         .-.        " RESET_COLOR,
                            LOGO_COLOR "      ( |   | |     " RESET_COLOR,
                            LOGO_COLOR "    |\\\\_)___/\\)/\\   " RESET_COLOR,
                            LOGO_COLOR "   <__)------(__/   " RESET_COLOR};
-static size_t logo_width = 20;
+
+struct Counters
+{
+    size_t curr;
+    size_t prev;
+};
+static size_t energy_unit;
+static size_t sample_rate;
+static struct task_struct *accumulator;
+static struct Counters *counters_core;
+static size_t core_num;
+static struct Counters *counters_pkg;
+static size_t pkg_num;
 
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
+static ssize_t kfetch_accumulate_power(void *);
 static ssize_t kfetch_read_system_info(char *, size_t);
 static ssize_t kfetch_read_power_info(char *, size_t);
 static int kfetch_open(struct inode *, struct file *);
 static int kfetch_release(struct inode *, struct file *);
+
+static dev_t dev;
+static struct cdev kfetch_cdev;
+static struct class *kfetch_cls;
+static atomic_t is_open = ATOMIC_INIT(CLOSED);
 const static struct file_operations kfetch_ops = {
     .owner = THIS_MODULE,
     .read = kfetch_read,
@@ -65,11 +89,17 @@ static int __init kfetch_init(void)
     kfetch_cls = class_create(KFETCH_DEV_NAME);
     device_create(kfetch_cls, NULL, dev, NULL, KFETCH_DEV_NAME);
     pr_info("Making the device file /dev/%s\n", KFETCH_DEV_NAME);
+
+    // Start probing power information
+
     return 0;
 }
 
 static void __exit kfetch_exit(void)
 {
+
+    // Stop probing power information
+
     device_destroy(kfetch_cls, dev);
     class_destroy(kfetch_cls);
     pr_info("Destroying the device /dev/%s\n", KFETCH_DEV_NAME);
@@ -81,6 +111,24 @@ static void __exit kfetch_exit(void)
     pr_info("Leave kfetch_mod\n");
 }
 
+static ssize_t kfetch_accumulate_power(void *args)
+{
+    while (!kthread_should_stop())
+    {
+
+        // read msr, add to counter for each core, package
+
+        if (kthread_should_stop())
+        {
+            break;
+        }
+
+        // wait (based on the sample rate)
+    }
+
+    return 0;
+}
+
 static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
 {
     ssize_t ret = 0;
@@ -89,7 +137,7 @@ static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
 
     char *hostname = utsname()->nodename;
     snprintf(buffer, buffer_size,
-             "%*c" TITLE_COLOR "%s" RESET_COLOR "\n", (int)logo_width, ' ', hostname);
+             "%*c" TITLE_COLOR "%s" RESET_COLOR "\n", KFETCH_LOGO_WIDTH, ' ', hostname);
 
     // Seperate line
     infos[curr_info] = kmalloc(KFETCH_INFO_SIZE * sizeof(char), GFP_KERNEL);
