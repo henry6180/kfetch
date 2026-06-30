@@ -8,7 +8,7 @@
 #include <linux/atomic.h>
 #include <linux/uaccess.h>        //copy_to_user(), copy_from_user
 #include <linux/utsname.h>        //get the hostname and the release version
-#include <linux/cpumask.h>        //num_possible_cpus(), num_online_cpus()
+#include <linux/cpumask.h>        //num_present_cpus(), num_online_cpus()
 #include <linux/cpu.h>            //cpu_data()
 #include <linux/mm.h>             //si_meminfo()
 #include <linux/time_namespace.h> //uptime
@@ -27,9 +27,10 @@
 #define CLOSED 0
 #define OPENING 1
 
-#define MSR_RAPL_POWER_UNIT_AMD 0xC0010299
+#define AMD_MSR_RAPL_POWER_UNIT 0xC0010299
 #define MSR_CORE_ENERGY_STATUS 0xC001029A
 #define MSR_PACKAGE_ENERGY_STATUS 0xC001029B
+#define AMD_ENERGY_UNIT_MASK 0x01F00
 
 #define TITLE_COLOR "\033[0;33;1m"
 #define LOGO_COLOR "\033[;38;5;214;1m"
@@ -46,20 +47,30 @@ static char logo[7][64] = {LOGO_COLOR "         .-.        " RESET_COLOR,
 
 struct Counters
 {
-    size_t curr;
-    size_t prev;
+    unsigned long long curr;
+    unsigned long long prev;
 };
-static size_t energy_unit;
-static size_t sample_rate;
+static unsigned long long energy_unit;
+static size_t sample_rate_ms;
 static struct task_struct *accumulator;
+static struct mutex counter_lock;
 static struct Counters *counters_core;
 static size_t core_num;
 static struct Counters *counters_pkg;
 static size_t pkg_num;
 
+static struct Counters *core_uj;
+static struct Counters *pkg_uj;
+static size_t calculate_rate_ms;
+static struct task_struct *calculator;
+
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
-static ssize_t kfetch_accumulate_power(void *);
+static void calculate_cpu_topology(void);
+static void init_counter(struct Counters *);
+static void update_counter(struct Counters *, unsigned long long);
+static int kfetch_calculate_power(void *);
+static int kfetch_accumulate_energy(void *);
 static ssize_t kfetch_read_system_info(char *, size_t);
 static ssize_t kfetch_read_power_info(char *, size_t);
 static int kfetch_open(struct inode *, struct file *);
@@ -90,15 +101,55 @@ static int __init kfetch_init(void)
     device_create(kfetch_cls, NULL, dev, NULL, KFETCH_DEV_NAME);
     pr_info("Making the device file /dev/%s\n", KFETCH_DEV_NAME);
 
-    // Start probing power information
+    // Start accumulating energy counters and calculating power
+    mutex_init(&counter_lock);
+    calculate_cpu_topology();
+    counters_core = kmalloc(core_num * sizeof(struct Counters), GFP_KERNEL);
+    counters_pkg = kmalloc(core_num * sizeof(struct Counters), GFP_KERNEL);
+    for (int i = 0; i < core_num; i++)
+    {
+        init_counter(counters_core + i);
+    }
+    for (int i = 0; i < pkg_num; i++)
+    {
+        init_counter(counters_pkg + i);
+    }
+    rdmsrl_safe(AMD_MSR_RAPL_POWER_UNIT, &energy_unit);
+    energy_unit = (energy_unit & AMD_ENERGY_UNIT_MASK) >> 8;
+    // TODO: determine the sample rate
+    sample_rate_ms = 1;
+    accumulator = kthread_run(kfetch_accumulate_energy, NULL, "kfetch_accumulate_power");
+
+    // core_uj, pkg_uj: reuse of struct Counters
+    core_uj = kmalloc(sizeof(struct Counters), GFP_KERNEL);
+    init_counter(core_uj);
+    pkg_uj = kmalloc(sizeof(struct Counters), GFP_KERNEL);
+    init_counter(pkg_uj);
+    // TODO: determine the calculate rate
+    calculate_rate_ms = 100;
+    calculator = kthread_run(kfetch_calculate_power, NULL, "kfetch_calculate_power");
 
     return 0;
 }
 
 static void __exit kfetch_exit(void)
 {
-
-    // Stop probing power information
+    // Stop accumulating energy counters and calculating power
+    if (accumulator != NULL)
+    {
+        kthread_stop(accumulator);
+        pr_info("Stop probing cpu energy\n");
+    }
+    if (calculator != NULL)
+    {
+        kthread_stop(calculator);
+        pr_info("Stop calculating cpu power consumption\n");
+    }
+    mutex_destroy(&counter_lock);
+    kfree(counters_core);
+    kfree(counters_pkg);
+    kfree(core_uj);
+    kfree(pkg_uj);
 
     device_destroy(kfetch_cls, dev);
     class_destroy(kfetch_cls);
@@ -111,19 +162,131 @@ static void __exit kfetch_exit(void)
     pr_info("Leave kfetch_mod\n");
 }
 
-static ssize_t kfetch_accumulate_power(void *args)
+static void calculate_cpu_topology()
 {
+    struct cpumask *visited_cores = kmalloc(sizeof(struct cpumask), GFP_KERNEL);
+    struct cpumask *visited_pkgs = kmalloc(sizeof(struct cpumask), GFP_KERNEL);
+    cpumask_clear(visited_cores);
+    cpumask_clear(visited_pkgs);
+
+    size_t cpu;
+    for_each_present_cpu(cpu)
+    {
+        if (!cpumask_test_cpu(cpu, visited_cores))
+        {
+            core_num++;
+            // topology_sibling_cpumask: the mask where the core and its siblings are set.
+            cpumask_or(visited_cores, visited_cores, topology_sibling_cpumask(cpu));
+        }
+        if (cpumask_test_cpu(cpu, visited_pkgs))
+        {
+            pkg_num++;
+            // topology_core_cpumask: the mask where the cores on the same package are set.
+            cpumask_or(visited_cores, visited_cores, topology_core_cpumask(cpu));
+        }
+    }
+
+    kfree(visited_cores);
+    kfree(visited_pkgs);
+}
+
+static void init_counter(struct Counters *counter)
+{
+    counter->curr = 0;
+    counter->prev = 0;
+}
+
+static void update_counter(struct Counters *counter, unsigned long long value)
+{
+    mutex_lock(&counter_lock);
+    if (value >= counter->prev)
+    {
+        counter->curr += value - counter->prev;
+    }
+    else
+    {
+        counter->curr += UINT_MAX - counter->prev + value;
+    }
+    counter->prev = value;
+    mutex_unlock(&counter_lock);
+}
+
+static int kfetch_calculate_power(void *args)
+{
+    pr_info("kfetch_calculate_power is running.\n");
     while (!kthread_should_stop())
     {
+        unsigned long long core_sum = 0;
+        unsigned long long pkg_sum = 0;
+        mutex_lock(&counter_lock);
+        for (int i = 0; i < core_num; i++)
+        {
+            if (cpu_online(i))
+            {
+                core_sum += counters_core[i].curr;
+            }
+        }
+        for (int i = 0; i < pkg_num; i++)
+        {
+            pkg_sum += counters_pkg[i].curr;
+        }
+        mutex_unlock(&counter_lock);
 
-        // read msr, add to counter for each core, package
+        core_uj->prev = core_uj->curr;
+        core_uj->curr = div64_ul(core_sum * 1000000UL, BIT(energy_unit));
+        pkg_uj->prev = pkg_uj->curr;
+        pkg_uj->curr = div64_ul(pkg_sum * 1000000UL, BIT(energy_unit));
 
         if (kthread_should_stop())
         {
             break;
         }
 
-        // wait (based on the sample rate)
+        msleep_interruptible(calculate_rate_ms);
+    }
+    return 0;
+}
+
+static int kfetch_accumulate_energy(void *args)
+{
+    pr_info("kfetch_accumulate_energy is running.\n");
+    while (!kthread_should_stop())
+    {
+        // core
+        for (unsigned cpu = 0; cpu < core_num; cpu++)
+        {
+            if (cpu_online(cpu))
+            {
+                // read msr
+                unsigned long long value;
+                rdmsrl_safe_on_cpu(cpu, MSR_CORE_ENERGY_STATUS, &value);
+                // unsigned long long -> unsigned int
+                value &= UINT_MAX;
+                // update counter
+                update_counter(counters_core + cpu, value);
+            }
+        }
+        // package
+        for (unsigned pkg = 0; pkg < pkg_num; pkg++)
+        {
+            unsigned cpu = cpumask_first_and(
+                cpu_online_mask,
+                topology_die_cpumask(core_num / pkg_num * pkg));
+            // read msr
+            unsigned long long value;
+            rdmsrl_safe_on_cpu(cpu, MSR_PACKAGE_ENERGY_STATUS, &value);
+            // unsigned long long -> unsigned int
+            value &= UINT_MAX;
+            // update counter
+            update_counter(counters_pkg + pkg, value);
+        }
+
+        if (kthread_should_stop())
+        {
+            break;
+        }
+
+        msleep_interruptible(sample_rate_ms);
     }
 
     return 0;
@@ -190,7 +353,7 @@ static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
         }
         snprintf(infos[curr_info], KFETCH_INFO_SIZE,
                  TITLE_COLOR "CPUs:" RESET_COLOR "\t%u / %u",
-                 num_online_cpus(), num_possible_cpus());
+                 num_online_cpus(), num_present_cpus());
         curr_info++;
     }
 
@@ -275,6 +438,29 @@ cleanup:
 
 static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 {
+    unsigned long long core_sum = 0;
+    unsigned long long pkg_sum = 0;
+    mutex_lock(&counter_lock);
+    for (int i = 0; i < core_num; i++)
+    {
+        if (cpu_online(i))
+        {
+            core_sum += counters_core[i].curr;
+        }
+    }
+    for (int i = 0; i < pkg_num; i++)
+    {
+        pkg_sum += counters_pkg[i].curr;
+    }
+    mutex_unlock(&counter_lock);
+
+    unsigned long long core_uw = 1000 * div64_ul(core_uj->curr - core_uj->prev, calculate_rate_ms);
+    unsigned long long pkg_uw = 1000 * div64_ul(core_uj->curr - core_uj->prev, calculate_rate_ms);
+
+    snprintf(buffer, buffer_size,
+             "* core power: %llu uW.\n"
+             "* pkg power: %llu uW.\n",
+             core_uw, pkg_uw);
     return 0;
 }
 
