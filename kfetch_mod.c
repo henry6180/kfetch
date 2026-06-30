@@ -19,6 +19,8 @@
 #include <asm/cpu_device_id.h>
 #include <linux/mutex.h>
 
+#include <linux/version.h>
+
 #define KFETCH_DEV_NAME "kfetch"
 #define KFETCH_BUF_SIZE 2048
 #define KFETCH_INFO_SIZE 128
@@ -59,6 +61,7 @@ static size_t core_num;
 static struct Counters *counters_pkg;
 static size_t pkg_num;
 
+static struct mutex uj_lock;
 static struct Counters *core_uj;
 static struct Counters *pkg_uj;
 static size_t calculate_rate_ms;
@@ -68,7 +71,7 @@ static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
 static void calculate_cpu_topology(void);
 static void init_counter(struct Counters *);
-static void update_counter(struct Counters *, unsigned long long);
+static void update_counter(struct Counters *, unsigned, size_t);
 static int kfetch_calculate_power(void *);
 static int kfetch_accumulate_energy(void *);
 static ssize_t kfetch_read_system_info(char *, size_t);
@@ -105,7 +108,7 @@ static int __init kfetch_init(void)
     mutex_init(&counter_lock);
     calculate_cpu_topology();
     counters_core = kmalloc(core_num * sizeof(struct Counters), GFP_KERNEL);
-    counters_pkg = kmalloc(core_num * sizeof(struct Counters), GFP_KERNEL);
+    counters_pkg = kmalloc(pkg_num * sizeof(struct Counters), GFP_KERNEL);
     for (int i = 0; i < core_num; i++)
     {
         init_counter(counters_core + i);
@@ -114,19 +117,22 @@ static int __init kfetch_init(void)
     {
         init_counter(counters_pkg + i);
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0)
+    rdmsrq_safe(AMD_MSR_RAPL_POWER_UNIT, &energy_unit);
+#else
     rdmsrl_safe(AMD_MSR_RAPL_POWER_UNIT, &energy_unit);
+#endif
     energy_unit = (energy_unit & AMD_ENERGY_UNIT_MASK) >> 8;
-    // TODO: determine the sample rate
-    sample_rate_ms = 1;
+    sample_rate_ms = 100;
     accumulator = kthread_run(kfetch_accumulate_energy, NULL, "kfetch_accumulate_power");
-
+    
+    mutex_init(&uj_lock);
     // core_uj, pkg_uj: reuse of struct Counters
     core_uj = kmalloc(sizeof(struct Counters), GFP_KERNEL);
     init_counter(core_uj);
     pkg_uj = kmalloc(sizeof(struct Counters), GFP_KERNEL);
     init_counter(pkg_uj);
-    // TODO: determine the calculate rate
-    calculate_rate_ms = 100;
+    calculate_rate_ms = sample_rate_ms * 10;
     calculator = kthread_run(kfetch_calculate_power, NULL, "kfetch_calculate_power");
 
     return 0;
@@ -146,6 +152,7 @@ static void __exit kfetch_exit(void)
         pr_info("Stop calculating cpu power consumption\n");
     }
     mutex_destroy(&counter_lock);
+    mutex_destroy(&uj_lock);
     kfree(counters_core);
     kfree(counters_pkg);
     kfree(core_uj);
@@ -178,11 +185,11 @@ static void calculate_cpu_topology()
             // topology_sibling_cpumask: the mask where the core and its siblings are set.
             cpumask_or(visited_cores, visited_cores, topology_sibling_cpumask(cpu));
         }
-        if (cpumask_test_cpu(cpu, visited_pkgs))
+        if (!cpumask_test_cpu(cpu, visited_pkgs))
         {
             pkg_num++;
             // topology_core_cpumask: the mask where the cores on the same package are set.
-            cpumask_or(visited_cores, visited_cores, topology_core_cpumask(cpu));
+            cpumask_or(visited_pkgs, visited_pkgs, topology_core_cpumask(cpu));
         }
     }
 
@@ -196,8 +203,19 @@ static void init_counter(struct Counters *counter)
     counter->prev = 0;
 }
 
-static void update_counter(struct Counters *counter, unsigned long long value)
+static void update_counter(struct Counters *counter, unsigned cpu, size_t msr_no)
 {
+    // read msr
+    unsigned long long value;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0)
+    rdmsrq_safe_on_cpu(cpu, msr_no, &value);
+#else
+    rdmsrl_safe_on_cpu(cpu, msr_no, &value);
+#endif
+    // unsigned long long -> unsigned int
+    value &= UINT_MAX;
+    
+    // update counter
     mutex_lock(&counter_lock);
     if (value >= counter->prev)
     {
@@ -232,10 +250,12 @@ static int kfetch_calculate_power(void *args)
         }
         mutex_unlock(&counter_lock);
 
+        mutex_lock(&uj_lock);
         core_uj->prev = core_uj->curr;
         core_uj->curr = div64_ul(core_sum * 1000000UL, BIT(energy_unit));
         pkg_uj->prev = pkg_uj->curr;
         pkg_uj->curr = div64_ul(pkg_sum * 1000000UL, BIT(energy_unit));
+        mutex_unlock(&uj_lock);
 
         if (kthread_should_stop())
         {
@@ -257,13 +277,7 @@ static int kfetch_accumulate_energy(void *args)
         {
             if (cpu_online(cpu))
             {
-                // read msr
-                unsigned long long value;
-                rdmsrl_safe_on_cpu(cpu, MSR_CORE_ENERGY_STATUS, &value);
-                // unsigned long long -> unsigned int
-                value &= UINT_MAX;
-                // update counter
-                update_counter(counters_core + cpu, value);
+                update_counter(counters_core + cpu, cpu, MSR_CORE_ENERGY_STATUS);
             }
         }
         // package
@@ -272,13 +286,7 @@ static int kfetch_accumulate_energy(void *args)
             unsigned cpu = cpumask_first_and(
                 cpu_online_mask,
                 topology_die_cpumask(core_num / pkg_num * pkg));
-            // read msr
-            unsigned long long value;
-            rdmsrl_safe_on_cpu(cpu, MSR_PACKAGE_ENERGY_STATUS, &value);
-            // unsigned long long -> unsigned int
-            value &= UINT_MAX;
-            // update counter
-            update_counter(counters_pkg + pkg, value);
+            update_counter(counters_pkg + pkg, cpu, MSR_PACKAGE_ENERGY_STATUS);
         }
 
         if (kthread_should_stop())
@@ -362,7 +370,8 @@ static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
     {
         struct sysinfo mem;
         si_meminfo(&mem);
-        size_t mem_free = (mem.freeram << PAGE_SHIFT) >> 20;
+        size_t cached_pages = mem.bufferram + global_node_page_state(NR_FILE_PAGES); 
+        size_t mem_avail = ((mem.freeram + cached_pages) << PAGE_SHIFT) >> 20;
         size_t mem_total = (mem.totalram << PAGE_SHIFT) >> 20;
         infos[curr_info] = kmalloc(KFETCH_INFO_SIZE * sizeof(char), GFP_KERNEL);
         if (infos[curr_info] == NULL)
@@ -371,7 +380,7 @@ static ssize_t kfetch_read_system_info(char *buffer, size_t buffer_size)
             goto cleanup;
         }
         snprintf(infos[curr_info], KFETCH_INFO_SIZE,
-                 TITLE_COLOR "Mem:" RESET_COLOR "\t%lu MB / %lu MB", mem_free, mem_total);
+                 TITLE_COLOR "Mem:" RESET_COLOR "\t%lu MB / %lu MB", mem_avail, mem_total);
         curr_info++;
     }
 
@@ -438,29 +447,18 @@ cleanup:
 
 static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 {
-    unsigned long long core_sum = 0;
-    unsigned long long pkg_sum = 0;
-    mutex_lock(&counter_lock);
-    for (int i = 0; i < core_num; i++)
-    {
-        if (cpu_online(i))
-        {
-            core_sum += counters_core[i].curr;
-        }
-    }
-    for (int i = 0; i < pkg_num; i++)
-    {
-        pkg_sum += counters_pkg[i].curr;
-    }
-    mutex_unlock(&counter_lock);
-
     unsigned long long core_uw = 1000 * div64_ul(core_uj->curr - core_uj->prev, calculate_rate_ms);
-    unsigned long long pkg_uw = 1000 * div64_ul(core_uj->curr - core_uj->prev, calculate_rate_ms);
+    unsigned long long pkg_uw = 1000 * div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
 
+    unsigned core_w_rem = 0;
+    div_u64_rem(core_uw, 1000000UL, &core_w_rem);
+    unsigned pkg_w_rem = 0;
+    div_u64_rem(pkg_uw, 1000000UL, &pkg_w_rem);
     snprintf(buffer, buffer_size,
-             "* core power: %llu uW.\n"
-             "* pkg power: %llu uW.\n",
-             core_uw, pkg_uw);
+             "\n"
+             "* core power: %llu.%u W.\n"
+             "* pkg power:  %llu.%u W.\n",
+             div64_ul(core_uw, 1000000UL), core_w_rem, div64_ul(pkg_uw, 1000000UL), pkg_w_rem);
     return 0;
 }
 
