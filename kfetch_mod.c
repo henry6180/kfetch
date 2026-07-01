@@ -122,10 +122,10 @@ static int __init kfetch_init(void)
     energy_unit = (energy_unit & AMD_ENERGY_UNIT_MASK) >> 8;
     sample_rate_ms = 100;
     accumulator = kthread_run(kfetch_accumulate_energy, NULL, "kfetch_accumulate_power");
-    
+
     // Init calculator
     mutex_init(&uj_lock);
-    core_uj = init_counter(1);
+    core_uj = init_counter(core_num);
     pkg_uj = init_counter(1);
     if (core_uj == NULL || pkg_uj == NULL)
     {
@@ -241,16 +241,16 @@ static void update_counter(struct Counters *counter, unsigned cpu, size_t msr_no
 static int kfetch_calculate_power(void *args)
 {
     pr_info("kfetch_calculate_power is running.\n");
+    unsigned long long *copy = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
     while (!kthread_should_stop())
     {
-        unsigned long long core_sum = 0;
         unsigned long long pkg_sum = 0;
         mutex_lock(&counter_lock);
         for (int i = 0; i < core_num; i++)
         {
             if (cpu_online(i))
             {
-                core_sum += counters_core[i].curr;
+                copy[i] = counters_core[i].curr;
             }
         }
         for (int i = 0; i < pkg_num; i++)
@@ -260,8 +260,14 @@ static int kfetch_calculate_power(void *args)
         mutex_unlock(&counter_lock);
 
         mutex_lock(&uj_lock);
-        core_uj->prev = core_uj->curr;
-        core_uj->curr = div64_ul(core_sum * 1000000UL, BIT(energy_unit));
+        for (int i = 0; i < core_num; i++)
+        {
+            if (cpu_online(i))
+            {
+                core_uj[i].prev = core_uj[i].curr;
+                core_uj[i].curr = div64_ul(copy[i] * 1000000UL, BIT(energy_unit));
+            }
+        }
         pkg_uj->prev = pkg_uj->curr;
         pkg_uj->curr = div64_ul(pkg_sum * 1000000UL, BIT(energy_unit));
         mutex_unlock(&uj_lock);
@@ -273,6 +279,7 @@ static int kfetch_calculate_power(void *args)
 
         msleep_interruptible(calculate_rate_ms);
     }
+    kfree(copy);
     return 0;
 }
 
@@ -461,8 +468,16 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
         return strlen(buffer);
     }
 
-    unsigned long long core_uw = 1000 * div64_ul(core_uj->curr - core_uj->prev, calculate_rate_ms);
     unsigned long long pkg_uw = 1000 * div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
+    unsigned long long core_uw = 0;
+    for (int i = 0; i < core_num; i++)
+    {
+        if (cpu_online(i))
+        {
+            core_uw += 1000 * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
+        }
+    }
+
     if (core_uw > __LONG_LONG_MAX__ || core_uw > __LONG_LONG_MAX__)
     {
         pr_info("Power of cpu cores or packages overflow\n");
