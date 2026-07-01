@@ -18,6 +18,7 @@
 #include <linux/delay.h>
 #include <asm/cpu_device_id.h>
 #include <linux/mutex.h>
+#include <linux/min_heap.h>
 
 #include <linux/version.h>
 
@@ -66,6 +67,17 @@ static struct Counters *core_uj;
 static struct Counters *pkg_uj;
 static size_t calculate_rate_ms;
 static struct task_struct *calculator;
+
+struct Timeinfo
+{
+    pid_t pid;
+    u64 utime_last;
+    u64 stime_last;
+    u64 timestamp;  // ktime_get_ns()
+    struct Timeinfo *next;
+    struct Timeinfo *prev;
+};
+static struct Timeinfo *timeinfo_head;
 
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
@@ -271,6 +283,9 @@ static int kfetch_calculate_power(void *args)
         pkg_uj->prev = pkg_uj->curr;
         pkg_uj->curr = div64_ul(pkg_sum * 1000000UL, BIT(energy_unit));
         mutex_unlock(&uj_lock);
+
+        // TODO: record timeinfo for each process
+
 
         if (kthread_should_stop())
         {
@@ -500,7 +515,13 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 
     if ((mask >> 7) & 1)
     {
-        // shows pid(width=8), process name(wid=32), and the power(width=8) of the top-n processes.
+        /* TODO
+            retrieve utime, stime for each process.
+            calculate cpu usage by current runtime and last runtime recorded in timeinfo.
+            calculate process power by cpu usage and core power.
+            use a min_heap to find the top-n power-intensive processes.
+            shows pid(width=8), process name(wid=32), and the power(width=8) of these processes.
+        */
     }
 
     return strlen(buffer);

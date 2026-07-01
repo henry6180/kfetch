@@ -53,7 +53,7 @@ void usage(const char *progname)
             "\t-r  Show the kernel release information\n"
             "\t-u  Show how long the system has been running\n"
             "\t-s, --show-cpu-power  Show the cpu power information\n"
-            "\t-d, --show-proc-power Show the top-n most energy-intensive processes\n");
+            "\t-d, --show-proc-power Show the top-n most power-intensive processes\n");
 }
 
 int main(int argc, char *argv[])
