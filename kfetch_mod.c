@@ -18,8 +18,9 @@
 #include <linux/delay.h>
 #include <asm/cpu_device_id.h>
 #include <linux/mutex.h>
-#include <linux/min_heap.h>
-
+#include <linux/hashtable.h>
+#include <linux/sort.h>
+#include <linux/jiffies.h>
 #include <linux/version.h>
 
 #define KFETCH_DEV_NAME "kfetch"
@@ -71,19 +72,35 @@ static struct task_struct *calculator;
 struct Timeinfo
 {
     pid_t pid;
-    u64 utime_last;
-    u64 stime_last;
-    u64 timestamp;  // ktime_get_ns()
-    struct Timeinfo *next;
-    struct Timeinfo *prev;
+    u64 utime;
+    u64 stime;
+    u64 timestamp;
+    u64 cpu_ratio; // [0, 1000]
+    int cpu_id;
+    struct hlist_node node;
 };
-static struct Timeinfo *timeinfo_head;
+struct Powerinfo
+{
+    pid_t pid;
+    char name[TASK_COMM_LEN];
+    unsigned long long watt;
+};
+DEFINE_HASHTABLE(timeinfos, 16);
+static size_t timeinfo_num;
+static struct mutex timeinfo_lock;
+static size_t record_rate_ms;
+static struct task_struct *recorder;
 
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
 static void calculate_cpu_topology(void);
 static struct Counters *init_counter(size_t);
 static void update_counter(struct Counters *, unsigned, size_t);
+static void init_timeinfos(void);
+static void update_timeinfo(struct task_struct *);
+static void delete_timeinfos(void);
+static int compare_power(const void *, const void *);
+static int kfetch_record_runtime(void *);
 static int kfetch_calculate_power(void *);
 static int kfetch_accumulate_energy(void *);
 static ssize_t kfetch_read_system_info(char *, size_t);
@@ -141,34 +158,54 @@ static int __init kfetch_init(void)
     pkg_uj = init_counter(1);
     if (core_uj == NULL || pkg_uj == NULL)
     {
-        pr_info("Failed to allocate space to counters_core or counters_pkg.\n");
+        pr_info("Failed to allocate space to core_uj or pkg_uj.\n");
         return -1;
     }
-    calculate_rate_ms = sample_rate_ms * 10;
+    calculate_rate_ms = 1000;
     calculator = kthread_run(kfetch_calculate_power, NULL, "kfetch_calculate_power");
 
+    // Init recorder
+    mutex_init(&timeinfo_lock);
+    timeinfo_num = 0;
+    init_timeinfos();
+    if (timeinfo_num == 0)
+    {
+        pr_info("Failed to initialize the hash table of timeinfos\n");
+        return -1;
+    }
+    record_rate_ms = 500;
+    recorder = kthread_run(kfetch_record_runtime, NULL, "kfetch_record_runtime");
     return 0;
 }
 
 static void __exit kfetch_exit(void)
 {
-    // Stop accumulating energy counters and calculating power
+    // Stop accumulating energy
     if (accumulator != NULL)
     {
         kthread_stop(accumulator);
         pr_info("Stop probing cpu energy\n");
     }
+    mutex_destroy(&counter_lock);
+    kfree(counters_core);
+    kfree(counters_pkg);
+    // Stop calculating power
     if (calculator != NULL)
     {
         kthread_stop(calculator);
         pr_info("Stop calculating cpu power consumption\n");
     }
-    mutex_destroy(&counter_lock);
     mutex_destroy(&uj_lock);
-    kfree(counters_core);
-    kfree(counters_pkg);
     kfree(core_uj);
     kfree(pkg_uj);
+    // Stop recording timeinfos
+    if (recorder != NULL)
+    {
+        kthread_stop(recorder);
+        pr_info("Stop recording timeinfos of processes\n");
+    }
+    delete_timeinfos();
+    mutex_destroy(&timeinfo_lock);
 
     device_destroy(kfetch_cls, dev);
     class_destroy(kfetch_cls);
@@ -250,6 +287,148 @@ static void update_counter(struct Counters *counter, unsigned cpu, size_t msr_no
     mutex_unlock(&counter_lock);
 }
 
+static void init_timeinfos()
+{
+    struct task_struct *task;
+    rcu_read_lock();
+    mutex_lock(&timeinfo_lock);
+    for_each_process(task)
+    {
+        struct Timeinfo *timeinfo = kmalloc(sizeof(struct Timeinfo), GFP_KERNEL);
+        if (timeinfo == NULL)
+        {
+            mutex_unlock(&timeinfo_lock);
+            delete_timeinfos();
+            timeinfo_num = 0;
+            return;
+        }
+        timeinfo->pid = task->pid;
+        timeinfo->utime = task->utime;
+        timeinfo->stime = task->stime;
+        timeinfo->timestamp = ktime_get_ns();
+        timeinfo->cpu_ratio = 0;
+        timeinfo->cpu_id = task_cpu(task);
+        hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
+        timeinfo_num++;
+    }
+    mutex_unlock(&timeinfo_lock);
+    rcu_read_unlock();
+}
+
+static void update_timeinfo(struct task_struct *curr_task)
+{
+    struct Timeinfo *timeinfo;
+    mutex_lock(&timeinfo_lock);
+    bool found = false;
+    hash_for_each_possible(timeinfos, timeinfo, node, curr_task->pid)
+    {
+        if (timeinfo->pid == curr_task->pid)
+        {
+            // struct Timeinfo old = *timeinfo;
+            u64 utime_old = timeinfo->utime;
+            u64 stime_old = timeinfo->stime;
+            u64 timestamp_old = timeinfo->timestamp;
+            timeinfo->utime = curr_task->utime;
+            timeinfo->stime = curr_task->stime;
+            timeinfo->timestamp = ktime_get_ns();
+            timeinfo->cpu_id = task_cpu(curr_task);
+            // the process is recreated
+            if (curr_task->start_boottime < timestamp_old)
+            {
+                timeinfo->cpu_ratio = 0;
+            }
+            else
+            {
+                u64 utime_diff = timeinfo->utime - utime_old;
+                u64 stime_diff = timeinfo->stime - stime_old;
+                u64 time_diff_ns = timeinfo->timestamp - timestamp_old;
+                //jiffies64_to_nsecs(utime_diff + stime_diff)
+                timeinfo->cpu_ratio = div64_ul(1000UL * (utime_diff + stime_diff), time_diff_ns);
+            }
+            found = true;
+            break;
+        }
+    }
+    // the process is newly created
+    if (!found)
+    {
+        struct Timeinfo *timeinfo = kmalloc(sizeof(struct Timeinfo), GFP_KERNEL);
+        if (timeinfo == NULL)
+        {
+            mutex_unlock(&timeinfo_lock);
+            delete_timeinfos();
+            timeinfo_num = 0;
+            return;
+        }
+        timeinfo->pid = curr_task->pid;
+        timeinfo->utime = curr_task->utime;
+        timeinfo->stime = curr_task->stime;
+        timeinfo->timestamp = ktime_get_ns();
+        timeinfo->cpu_ratio = 0;
+        timeinfo->cpu_id = task_cpu(curr_task);
+        hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
+        timeinfo_num++;
+    }
+    mutex_unlock(&timeinfo_lock);
+}
+
+static void delete_timeinfos()
+{
+    struct Timeinfo *timeinfo;
+    struct hlist_node *tmp;
+    int bucket;
+    mutex_lock(&timeinfo_lock);
+    hash_for_each_safe(timeinfos, bucket, tmp, timeinfo, node)
+    {
+        hash_del(&timeinfo->node);
+        kfree(timeinfo);
+    }
+    mutex_unlock(&timeinfo_lock);
+}
+
+static int compare_power(const void *lhs, const void *rhs)
+{
+    const struct Powerinfo *powerinfo_lhs = (const struct Powerinfo *)lhs;
+    const struct Powerinfo *powerinfo_rhs = (const struct Powerinfo *)rhs;
+    if (powerinfo_lhs->watt < powerinfo_rhs->watt)
+    {
+        return 1;
+    }
+    if (powerinfo_lhs->watt == powerinfo_rhs->watt)
+    {
+        return 0;
+    }
+    return -1;
+}
+
+static int kfetch_record_runtime(void *args)
+{
+    pr_info("kfetch_record_runtime is running.\n");
+    while (!kthread_should_stop())
+    {
+        struct task_struct *task;
+        rcu_read_lock();
+        for_each_process(task)
+        {
+            update_timeinfo(task);
+            if (timeinfo_num == 0)
+            {
+                pr_info("Failed to update the hash table of timeinfos\n");
+                return -1;
+            }
+        }
+        rcu_read_unlock();
+
+        if (kthread_should_stop())
+        {
+            break;
+        }
+
+        msleep_interruptible(record_rate_ms);
+    }
+    return 0;
+}
+
 static int kfetch_calculate_power(void *args)
 {
     pr_info("kfetch_calculate_power is running.\n");
@@ -283,9 +462,6 @@ static int kfetch_calculate_power(void *args)
         pkg_uj->prev = pkg_uj->curr;
         pkg_uj->curr = div64_ul(pkg_sum * 1000000UL, BIT(energy_unit));
         mutex_unlock(&uj_lock);
-
-        // TODO: record timeinfo for each process
-
 
         if (kthread_should_stop())
         {
@@ -483,45 +659,80 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
         return strlen(buffer);
     }
 
+    size_t sep_len = 64;
+    char seperate_line[KFETCH_INFO_SIZE] = "";
+    memset(seperate_line, '=', sep_len - 1);
+    seperate_line[sep_len - 1] = '\n';
+    seperate_line[sep_len] = '\0';
+
     unsigned long long pkg_uw = 1000 * div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
+    unsigned long long *core_uws = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
     unsigned long long core_uw = 0;
     for (int i = 0; i < core_num; i++)
     {
         if (cpu_online(i))
         {
-            core_uw += 1000 * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
+            // core_uw += 1000 * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
+            core_uws[i] = 1000UL * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
+            core_uw += core_uws[i];
         }
     }
-
-    if (core_uw > __LONG_LONG_MAX__ || core_uw > __LONG_LONG_MAX__)
+    if (core_uw > __LONG_LONG_MAX__ || pkg_uw > __LONG_LONG_MAX__)
     {
         pr_info("Power of cpu cores or packages overflow\n");
+        kfree(core_uws);
         return -1;
     }
+
     if (core_uw == 0 || pkg_uw == 0)
     {
-        snprintf(buffer, buffer_size, "Power of cpu cores or packages == 0.\n");
-        return strlen(buffer);
+        snprintf(buffer, buffer_size, "%sPower of cpu cores or packages == 0.\n", seperate_line);
     }
-
-    unsigned core_w_rem = 0;
-    div_u64_rem(core_uw, 1000000UL, &core_w_rem);
-    unsigned pkg_w_rem = 0;
-    div_u64_rem(pkg_uw, 1000000UL, &pkg_w_rem);
-    snprintf(buffer, buffer_size,
-             "\n"
-             "pkg power:  %llu.%u W\tcore power: %llu.%u W.\n",
-             div64_ul(pkg_uw, 1000000UL), pkg_w_rem, div64_ul(core_uw, 1000000UL), core_w_rem);
+    else
+    {
+        unsigned core_w_rem = 0;
+        div_u64_rem(core_uw, 1000000UL, &core_w_rem);
+        unsigned pkg_w_rem = 0;
+        div_u64_rem(pkg_uw, 1000000UL, &pkg_w_rem);
+        snprintf(buffer, buffer_size,
+                 "%spkg power: %llu.%u W\tcore power: %llu.%u W.\n",
+                 seperate_line, div64_ul(pkg_uw, 1000000UL), pkg_w_rem / 1000,
+                 div64_ul(core_uw, 1000000UL), core_w_rem / 1000);
+    }
 
     if ((mask >> 7) & 1)
     {
-        /* TODO
-            retrieve utime, stime for each process.
-            calculate cpu usage by current runtime and last runtime recorded in timeinfo.
-            calculate process power by cpu usage and core power.
-            use a min_heap to find the top-n power-intensive processes.
-            shows pid(width=8), process name(wid=32), and the power(width=8) of these processes.
-        */
+        struct task_struct *task;
+        struct Timeinfo *timeinfo;
+        struct Powerinfo *powerinfos = kmalloc(timeinfo_num * sizeof(struct Powerinfo), GFP_KERNEL);
+        int count = 0;
+        rcu_read_lock();
+        for_each_process(task)
+        {
+            hash_for_each_possible(timeinfos, timeinfo, node, task->pid)
+            {
+                if (timeinfo->pid == task->pid)
+                {
+                    powerinfos[count].pid = task->pid;
+                    get_task_comm(powerinfos[count].name, task);
+                    powerinfos[count].watt = div64_ul((core_uws[timeinfo->cpu_id] * timeinfo->cpu_ratio), 1000UL);
+                    count++;
+                    break;
+                }
+            }
+        }
+        rcu_read_unlock();
+        sort(powerinfos, count, sizeof(struct Powerinfo), compare_power, NULL);
+        char buf[KFETCH_INFO_SIZE] = "";
+        // strncat(buffer, seperate_line, buffer_size - sep_len - 1);
+        strncat(buffer, "pid\tprocess name\t\twatt(uw)\n", buffer_size - strlen(buffer) - 1);
+        for (int i = 0; i < min(10, count); i++)
+        {
+            snprintf(buf, KFETCH_INFO_SIZE, "%d\t%s\t\t%llu\n", powerinfos[i].pid, powerinfos[i].name, powerinfos[i].watt);
+            strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
+        }
+        strncat(buffer, seperate_line, buffer_size - sep_len - 1);
+        kfree(powerinfos);
     }
 
     return strlen(buffer);
