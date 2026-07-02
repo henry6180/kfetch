@@ -76,7 +76,7 @@ struct Timeinfo
     u64 stime;
     u64 timestamp;
     u64 cpu_ratio; // [0, 1000]
-    int cpu_id;
+    int core_id;
     struct hlist_node node;
 };
 struct Powerinfo
@@ -175,6 +175,7 @@ static int __init kfetch_init(void)
     }
     record_rate_ms = 500;
     recorder = kthread_run(kfetch_record_runtime, NULL, "kfetch_record_runtime");
+
     return 0;
 }
 
@@ -307,7 +308,9 @@ static void init_timeinfos()
         timeinfo->stime = task->stime;
         timeinfo->timestamp = ktime_get_ns();
         timeinfo->cpu_ratio = 0;
-        timeinfo->cpu_id = task_cpu(task);
+
+        timeinfo->core_id = topology_physical_package_id(task_cpu(task)) * (core_num / pkg_num) + topology_core_id(task_cpu(task));
+
         hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
         timeinfo_num++;
     }
@@ -331,7 +334,7 @@ static void update_timeinfo(struct task_struct *curr_task)
             timeinfo->utime = curr_task->utime;
             timeinfo->stime = curr_task->stime;
             timeinfo->timestamp = ktime_get_ns();
-            timeinfo->cpu_id = task_cpu(curr_task);
+            timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
             // the process is recreated
             if (curr_task->start_boottime < timestamp_old)
             {
@@ -365,7 +368,7 @@ static void update_timeinfo(struct task_struct *curr_task)
         timeinfo->stime = curr_task->stime;
         timeinfo->timestamp = ktime_get_ns();
         timeinfo->cpu_ratio = 0;
-        timeinfo->cpu_id = task_cpu(curr_task);
+        timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
         hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
         timeinfo_num++;
     }
@@ -665,6 +668,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
     seperate_line[sep_len - 1] = '\n';
     seperate_line[sep_len] = '\0';
 
+    mutex_lock(&uj_lock);
     unsigned long long pkg_uw = 1000 * div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
     unsigned long long *core_uws = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
     unsigned long long core_uw = 0;
@@ -672,11 +676,15 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
     {
         if (cpu_online(i))
         {
-            // core_uw += 1000 * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
             core_uws[i] = 1000UL * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
             core_uw += core_uws[i];
         }
+        else
+        {
+            core_uws[i] = 0;
+        }
     }
+    mutex_unlock(&uj_lock);
     if (core_uw > __LONG_LONG_MAX__ || pkg_uw > __LONG_LONG_MAX__)
     {
         pr_info("Power of cpu cores or packages overflow\n");
@@ -715,7 +723,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
                 {
                     powerinfos[count].pid = task->pid;
                     get_task_comm(powerinfos[count].name, task);
-                    powerinfos[count].watt = div64_ul((core_uws[timeinfo->cpu_id] * timeinfo->cpu_ratio), 1000UL);
+                    powerinfos[count].watt = div64_ul((core_uws[timeinfo->core_id] * timeinfo->cpu_ratio), 1000UL);
                     count++;
                     break;
                 }
