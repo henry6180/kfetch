@@ -75,7 +75,7 @@ struct Timeinfo
     u64 utime;
     u64 stime;
     u64 timestamp;
-    u64 cpu_ratio; // [0, 1000]
+    u64 cpu_ratio; // [0 ~ 1000]
     int core_id;
     struct hlist_node node;
 };
@@ -83,7 +83,7 @@ struct Powerinfo
 {
     pid_t pid;
     char name[TASK_COMM_LEN];
-    unsigned long long watt;
+    unsigned long long mw;
 };
 DEFINE_HASHTABLE(timeinfos, 16);
 static size_t timeinfo_num;
@@ -327,26 +327,22 @@ static void update_timeinfo(struct task_struct *curr_task)
     {
         if (timeinfo->pid == curr_task->pid)
         {
-            // struct Timeinfo old = *timeinfo;
-            u64 utime_old = timeinfo->utime;
-            u64 stime_old = timeinfo->stime;
-            u64 timestamp_old = timeinfo->timestamp;
+            struct Timeinfo old = *timeinfo;
             timeinfo->utime = curr_task->utime;
             timeinfo->stime = curr_task->stime;
             timeinfo->timestamp = ktime_get_ns();
             timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
             // the process is recreated
-            if (curr_task->start_boottime < timestamp_old)
+            if (curr_task->start_boottime > old.timestamp)
             {
                 timeinfo->cpu_ratio = 0;
             }
             else
             {
-                u64 utime_diff = timeinfo->utime - utime_old;
-                u64 stime_diff = timeinfo->stime - stime_old;
-                u64 time_diff_ns = timeinfo->timestamp - timestamp_old;
-                //jiffies64_to_nsecs(utime_diff + stime_diff)
-                timeinfo->cpu_ratio = div64_ul(1000UL * (utime_diff + stime_diff), time_diff_ns);
+                u64 utime_diff = timeinfo->utime - old.utime;   // ns
+                u64 stime_diff = timeinfo->stime - old.stime;   // ns
+                u64 time_diff_us = div64_ul(timeinfo->timestamp - old.timestamp, 1000UL);   // us
+                timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us); // [0 ~ 1000]
             }
             found = true;
             break;
@@ -393,11 +389,11 @@ static int compare_power(const void *lhs, const void *rhs)
 {
     const struct Powerinfo *powerinfo_lhs = (const struct Powerinfo *)lhs;
     const struct Powerinfo *powerinfo_rhs = (const struct Powerinfo *)rhs;
-    if (powerinfo_lhs->watt < powerinfo_rhs->watt)
+    if (powerinfo_lhs->mw < powerinfo_rhs->mw)
     {
         return 1;
     }
-    if (powerinfo_lhs->watt == powerinfo_rhs->watt)
+    if (powerinfo_lhs->mw == powerinfo_rhs->mw)
     {
         return 0;
     }
@@ -669,43 +665,38 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
     seperate_line[sep_len] = '\0';
 
     mutex_lock(&uj_lock);
-    unsigned long long pkg_uw = 1000 * div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
-    unsigned long long *core_uws = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
-    unsigned long long core_uw = 0;
+    unsigned long long pkg_mw = div64_ul(pkg_uj->curr - pkg_uj->prev, calculate_rate_ms);
+    unsigned long long *core_mws = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
+    unsigned long long core_mw = 0;
     for (int i = 0; i < core_num; i++)
     {
         if (cpu_online(i))
         {
-            core_uws[i] = 1000UL * div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
-            core_uw += core_uws[i];
+            core_mws[i] = div64_ul(core_uj[i].curr - core_uj[i].prev, calculate_rate_ms);
+            core_mw += core_mws[i];
         }
         else
         {
-            core_uws[i] = 0;
+            core_mws[i] = 0;
         }
     }
     mutex_unlock(&uj_lock);
-    if (core_uw > __LONG_LONG_MAX__ || pkg_uw > __LONG_LONG_MAX__)
+    if (core_mw > __LONG_LONG_MAX__ || pkg_mw > __LONG_LONG_MAX__)
     {
         pr_info("Power of cpu cores or packages overflow\n");
-        kfree(core_uws);
+        kfree(core_mws);
         return -1;
     }
 
-    if (core_uw == 0 || pkg_uw == 0)
+    if (core_mw == 0 || pkg_mw == 0)
     {
         snprintf(buffer, buffer_size, "%sPower of cpu cores or packages == 0.\n", seperate_line);
     }
     else
     {
-        unsigned core_w_rem = 0;
-        div_u64_rem(core_uw, 1000000UL, &core_w_rem);
-        unsigned pkg_w_rem = 0;
-        div_u64_rem(pkg_uw, 1000000UL, &pkg_w_rem);
         snprintf(buffer, buffer_size,
-                 "%spkg power: %llu.%u W\tcore power: %llu.%u W.\n",
-                 seperate_line, div64_ul(pkg_uw, 1000000UL), pkg_w_rem / 1000,
-                 div64_ul(core_uw, 1000000UL), core_w_rem / 1000);
+                 "%spkg power: %llumW\tcore power: %llumW.\n",
+                 seperate_line, pkg_mw, core_mw);
     }
 
     if ((mask >> 7) & 1)
@@ -723,7 +714,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
                 {
                     powerinfos[count].pid = task->pid;
                     get_task_comm(powerinfos[count].name, task);
-                    powerinfos[count].watt = div64_ul((core_uws[timeinfo->core_id] * timeinfo->cpu_ratio), 1000UL);
+                    powerinfos[count].mw = core_mws[timeinfo->core_id] * timeinfo->cpu_ratio / 1000;
                     count++;
                     break;
                 }
@@ -732,11 +723,12 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
         rcu_read_unlock();
         sort(powerinfos, count, sizeof(struct Powerinfo), compare_power, NULL);
         char buf[KFETCH_INFO_SIZE] = "";
-        // strncat(buffer, seperate_line, buffer_size - sep_len - 1);
-        strncat(buffer, "pid\tprocess name\t\twatt(uw)\n", buffer_size - strlen(buffer) - 1);
-        for (int i = 0; i < min(10, count); i++)
+        strncat(buffer, "pid\tprocess name\twatt(mw)\n", buffer_size - strlen(buffer) - 1);
+        for (int i = 0; i < min(10, count) && powerinfos[i].mw; i++)
         {
-            snprintf(buf, KFETCH_INFO_SIZE, "%d\t%s\t\t%llu\n", powerinfos[i].pid, powerinfos[i].name, powerinfos[i].watt);
+            snprintf(buf, KFETCH_INFO_SIZE, "%d\t%-*s%llu\n", powerinfos[i].pid, 
+                                                              TASK_COMM_LEN, powerinfos[i].name, 
+                                                              powerinfos[i].mw);
             strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
         }
         strncat(buffer, seperate_line, buffer_size - sep_len - 1);
