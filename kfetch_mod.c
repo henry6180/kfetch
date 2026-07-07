@@ -392,7 +392,6 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
             break;
         }
     }
-    mutex_unlock(&timeinfo_lock);
 
     // The task is newly created.
     if (timeinfo == NULL)
@@ -408,14 +407,11 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
         timeinfo->stime = timeinfo_new->stime;
         timeinfo->timestamp = timeinfo_new->timestamp;
         timeinfo->core_id = timeinfo_new->core_id;
-        mutex_lock(&timeinfo_lock);
         hash_add(timeinfo_table, &timeinfo->node, timeinfo->pid);
         timeinfo_num++;
-        mutex_unlock(&timeinfo_lock);
     }
     else
     {
-        mutex_lock(&timeinfo_lock);
         struct proc_timeinfo timeinfo_old = *timeinfo;
         timeinfo->utime = timeinfo_new->utime;
         timeinfo->stime = timeinfo_new->stime;
@@ -433,8 +429,8 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
             u64 time_diff_us = div64_ul(timeinfo->timestamp - timeinfo_old.timestamp, 1000UL); // us
             timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us);            // [0 ~ 1000]
         }
-        mutex_unlock(&timeinfo_lock);
     }
+    mutex_unlock(&timeinfo_lock);
 }
 
 static void delete_timeinfos()
