@@ -51,7 +51,9 @@ void usage(const char *progname)
             "\t-n  Show the number of CPU cores\n"
             "\t-p  Show the number of processes\n"
             "\t-r  Show the kernel release information\n"
-            "\t-u  Show how long the system has been running\n");
+            "\t-u  Show how long the system has been running\n"
+            "\t-s, --show-cpu-power  Show the cpu power information\n"
+            "\t-d, --show-proc-power Show the top-n most power-intensive processes\n");
 }
 
 int main(int argc, char *argv[])
@@ -59,9 +61,16 @@ int main(int argc, char *argv[])
     int fd;
     int opt;
     int mask_info;
+    int option_index;
+
+    static struct option long_options[] = {
+        {"show-cpu-power",  no_argument, NULL, 's'},
+        {"show-proc-power", no_argument, NULL, 'd'},
+        {NULL, 0, NULL, 0}
+    };
 
     mask_info = -1;
-    while ((opt = getopt(argc, argv, "acnmpruh")) != -1) {
+    while ((opt = getopt_long(argc, argv, "acnmpruhsd", long_options, &option_index)) != -1) {
         if (mask_info < 0)
             mask_info = 0;
         switch (opt) {
@@ -72,6 +81,8 @@ int main(int argc, char *argv[])
         case 'p': mask_info |= KFETCH_NUM_PROCS; break;
         case 'r': mask_info |= KFETCH_RELEASE; break;
         case 'u': mask_info |= KFETCH_UPTIME; break;
+        case 's': mask_info |= KFETCH_CPU_POWER; break;
+        case 'd': mask_info |= KFETCH_PROC_POWER; break;
         case 'h': usage(*argv); exit(EXIT_SUCCESS);
         case '?':
             fprintf(stderr, "Unknown option: %c\n", optopt);

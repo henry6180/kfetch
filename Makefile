@@ -6,24 +6,44 @@ all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 	gcc -O3 kfetch.c -o kfetch
 
-clean:
+clean: unload
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-	rm kfetch
+	rm -rf kfetch
 
-run:
+run: kfetch
 	sudo ./kfetch -a
 
 load:
+	@if lsmod | grep -q kfetch_mod; then \
+		echo "Module already loaded, unloading first..."; \
+		sudo rmmod -f kfetch_mod; \
+	fi
 	sudo insmod kfetch_mod.ko
 
-unload:
-	sudo rmmod -f kfetch_mod
+unload: 
+	@if lsmod | grep -q kfetch_mod; then \
+		sudo rmmod -f kfetch_mod; \
+	else \
+		echo "Module is not loaded."; \
+	fi
 
 info:
-	modinfo kfetch_mod.ko
+	@if lsmod | grep -q kfetch_mod; then \
+		modinfo kfetch_mod.ko; \
+	else \
+		echo "Module is not loaded."; \
+	fi
 
 list:
-	sudo lsmod | grep kfetch_mod
+	@if lsmod | grep -q kfetch_mod; then \
+		sudo lsmod | grep kfetch_mod; \
+	else \
+		echo "Module is not loaded."; \
+	fi
 
 log:
-	sudo journalctl --since "1 hour ago" | grep kernel
+	@if lsmod | grep -q kfetch_mod; then \
+		sudo journalctl --since "1 min ago" | grep kernel; \
+	else \
+		echo "Module is not loaded."; \
+	fi
