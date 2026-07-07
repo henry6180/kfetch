@@ -81,6 +81,7 @@ struct proc_timeinfo
     u64 mw;
     u32 cpu_ratio; // [0 ~ 1000]
     u32 core_id;
+    char name[TASK_COMM_LEN];
     struct hlist_node node;
 };
 DEFINE_HASHTABLE(timeinfo_table, 16);
@@ -88,13 +89,6 @@ static struct mutex timeinfo_lock;
 static u32 timeinfo_num;
 static u32 record_rate_ms;
 static struct task_struct *recorder;
-
-struct proc_powerinfo
-{
-    pid_t pid;
-    char name[TASK_COMM_LEN];
-    u64 mw;
-};
 
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
@@ -432,10 +426,10 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
             u64 time_diff_us = div64_ul(timeinfo->timestamp - timeinfo_old.timestamp, 1000UL); // us
             timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us);            // [0 ~ 1000]
             mutex_lock(&joule_lock);
-            u64 core_mw = div64_ul(core_uj[timeinfo->core_id][1] - core_uj[timeinfo->core_id][0], 
+            u64 core_mw = div64_ul(core_uj[timeinfo->core_id][1] - core_uj[timeinfo->core_id][0],
                                    calculate_rate_ms);
             mutex_unlock(&joule_lock);
-            if(timeinfo->core_id == timeinfo_old.core_id)
+            if (timeinfo->core_id == timeinfo_old.core_id)
             {
                 timeinfo->mw = div64_ul(core_mw * timeinfo->cpu_ratio, 1000);
             }
@@ -477,13 +471,13 @@ static struct task_struct *find_task(pid_t pid)
 
 static int compare_power(const void *lhs, const void *rhs)
 {
-    const struct proc_powerinfo *powerinfo_lhs = (const struct proc_powerinfo *)lhs;
-    const struct proc_powerinfo *powerinfo_rhs = (const struct proc_powerinfo *)rhs;
-    if (powerinfo_lhs->mw < powerinfo_rhs->mw)
+    const struct proc_timeinfo *timeinfo_lhs = (const struct proc_timeinfo *)lhs;
+    const struct proc_timeinfo *timeinfo_rhs = (const struct proc_timeinfo *)rhs;
+    if (timeinfo_lhs->mw < timeinfo_rhs->mw)
     {
         return 1;
     }
-    if (powerinfo_lhs->mw == powerinfo_rhs->mw)
+    if (timeinfo_lhs->mw == timeinfo_rhs->mw)
     {
         return 0;
     }
@@ -512,7 +506,7 @@ static int kfetch_record_runtime(void *args)
         {
             timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
             boottimes = kzalloc(task_num_with_guard * sizeof(u64), GFP_KERNEL);
-            if(timeinfos != NULL && boottimes != NULL)
+            if (timeinfos != NULL && boottimes != NULL)
             {
                 current_num = task_num_with_guard;
             }
@@ -521,15 +515,15 @@ static int kfetch_record_runtime(void *args)
         {
             struct proc_timeinfo *temp_infos = krealloc(timeinfos, task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
             u64 *temp_boottimes = krealloc(boottimes, task_num_with_guard * sizeof(u64), GFP_KERNEL);
-            if(temp_infos != NULL)
+            if (temp_infos != NULL)
             {
                 timeinfos = temp_infos;
             }
-            if(temp_boottimes != NULL)
+            if (temp_boottimes != NULL)
             {
                 boottimes = temp_boottimes;
             }
-            if(temp_infos != NULL && temp_boottimes != NULL)
+            if (temp_infos != NULL && temp_boottimes != NULL)
             {
                 current_num = task_num_with_guard;
             }
@@ -812,9 +806,9 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
     ssize_t ret = 0;
     u64 *core_mws = kzalloc(core_num * sizeof(u64), GFP_KERNEL);
     mutex_lock(&timeinfo_lock);
-    struct proc_powerinfo *powerinfos = kzalloc(timeinfo_num * sizeof(struct proc_powerinfo), GFP_KERNEL);
+    struct proc_timeinfo *timeinfos = kzalloc(timeinfo_num * sizeof(struct proc_timeinfo), GFP_KERNEL);
     mutex_unlock(&timeinfo_lock);
-    if (core_mws == NULL || powerinfos == NULL)
+    if (core_mws == NULL || timeinfos == NULL)
     {
         pr_info("Failed to allocate buffer spaces when reading power info.\n");
         return strlen(buffer);
@@ -861,7 +855,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
     }
     if ((mask >> 7) & 1)
     {
-        u32 powerinfo_num = 0;
+        u32 num = 0;
         struct proc_timeinfo *timeinfo;
         struct hlist_node *tmp;
         int bucket;
@@ -877,23 +871,22 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
             }
             else
             {
+                memcpy(timeinfos + num, timeinfo, sizeof(struct proc_timeinfo));
                 rcu_read_lock();
-                powerinfos[powerinfo_num].pid = task->pid;
-                get_task_comm(powerinfos[powerinfo_num].name, task);
+                get_task_comm(timeinfos[num].name, task);
                 rcu_read_unlock();
-                powerinfos[powerinfo_num].mw = timeinfo->mw;
-                powerinfo_num++;
+                num++;
             }
         }
         mutex_unlock(&timeinfo_lock);
-        sort(powerinfos, powerinfo_num, sizeof(struct proc_powerinfo), compare_power, NULL);
+        sort(timeinfos, num, sizeof(struct proc_timeinfo), compare_power, NULL);
 
         snprintf(buf, KFETCH_INFO_SIZE, "pid\tprocess name\twatt(mw)\n");
         strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
-        for (int i = 0; i < min(10, powerinfo_num) && powerinfos[i].mw; i++)
+        for (int i = 0; i < min(10, num) && timeinfos[i].mw; i++)
         {
-            snprintf(buf, KFETCH_INFO_SIZE, "%d\t%-*s%llu\n", powerinfos[i].pid,
-                     TASK_COMM_LEN, powerinfos[i].name, powerinfos[i].mw);
+            snprintf(buf, KFETCH_INFO_SIZE, "%d\t%-*s%llu\n", timeinfos[i].pid,
+                     TASK_COMM_LEN, timeinfos[i].name, timeinfos[i].mw);
             strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
         }
     }
@@ -903,7 +896,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 
 cleanup:
     kfree(core_mws);
-    kfree(powerinfos);
+    kfree(timeinfos);
 
     return ret;
 }
