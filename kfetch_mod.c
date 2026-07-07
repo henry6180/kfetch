@@ -418,8 +418,8 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
         timeinfo->stime = timeinfo_new->stime;
         timeinfo->timestamp = timeinfo_new->timestamp;
         timeinfo->core_id = timeinfo_new->core_id;
-        // the pid is reused by another task
-        if (boottime > timeinfo_old.timestamp)
+        // the pid is reused by another task or the task is run on another core
+        if (boottime > timeinfo_old.timestamp || timeinfo->core_id != timeinfo_old.core_id)
         {
             timeinfo->cpu_ratio = 0;
         }
