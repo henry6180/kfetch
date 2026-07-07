@@ -78,6 +78,7 @@ struct proc_timeinfo
     u64 utime;
     u64 stime;
     u64 timestamp;
+    u64 mw;
     u32 cpu_ratio; // [0 ~ 1000]
     u32 core_id;
     struct hlist_node node;
@@ -418,10 +419,11 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
         timeinfo->stime = timeinfo_new->stime;
         timeinfo->timestamp = timeinfo_new->timestamp;
         timeinfo->core_id = timeinfo_new->core_id;
-        // the pid is reused by another task or the task is run on another core
-        if (boottime > timeinfo_old.timestamp || timeinfo->core_id != timeinfo_old.core_id)
+        // the pid is reused by another task
+        if (boottime > timeinfo_old.timestamp)
         {
             timeinfo->cpu_ratio = 0;
+            timeinfo->mw = 0;
         }
         else
         {
@@ -429,6 +431,14 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
             u64 stime_diff = timeinfo->stime - timeinfo_old.stime;                             // ns
             u64 time_diff_us = div64_ul(timeinfo->timestamp - timeinfo_old.timestamp, 1000UL); // us
             timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us);            // [0 ~ 1000]
+            mutex_lock(&joule_lock);
+            u64 core_mw = div64_ul(core_uj[timeinfo->core_id][1] - core_uj[timeinfo->core_id][0], 
+                                   calculate_rate_ms);
+            mutex_unlock(&joule_lock);
+            if(timeinfo->core_id == timeinfo_old.core_id)
+            {
+                timeinfo->mw = div64_ul(core_mw * timeinfo->cpu_ratio, 1000);
+            }
         }
     }
     mutex_unlock(&timeinfo_lock);
@@ -871,7 +881,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
                 powerinfos[powerinfo_num].pid = task->pid;
                 get_task_comm(powerinfos[powerinfo_num].name, task);
                 rcu_read_unlock();
-                powerinfos[powerinfo_num].mw = core_mws[timeinfo->core_id] * timeinfo->cpu_ratio / 1000;
+                powerinfos[powerinfo_num].mw = timeinfo->mw;
                 powerinfo_num++;
             }
         }
