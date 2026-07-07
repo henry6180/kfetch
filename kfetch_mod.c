@@ -82,7 +82,7 @@ struct proc_timeinfo
     u32 core_id;
     struct hlist_node node;
 };
-DEFINE_HASHTABLE(timeinfos, 16);
+DEFINE_HASHTABLE(timeinfo_table, 16);
 static struct mutex timeinfo_lock;
 static u32 timeinfo_num;
 static u32 record_rate_ms;
@@ -98,6 +98,7 @@ struct proc_powerinfo
 static ssize_t kfetch_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t kfetch_write(struct file *, const char __user *, size_t, loff_t *);
 static void calculate_cpu_topology(void);
+static inline u32 get_core_id(unsigned int);
 static void update_counter(struct energy_counter *, unsigned, size_t);
 static void init_timeinfos(void);
 static void update_timeinfo(struct task_struct *);
@@ -141,7 +142,7 @@ static int __init kfetch_init(void)
     core_num = 0;
     pkg_num = 0;
     calculate_cpu_topology();
-    if(core_num == 0 || pkg_num == 0)
+    if (core_num == 0 || pkg_num == 0)
     {
         pr_info("Failed to calculate the number of cpu cores or cpu packages\n");
         return -1;
@@ -250,6 +251,10 @@ static void calculate_cpu_topology()
 {
     struct cpumask *visited_cores = kmalloc(sizeof(struct cpumask), GFP_KERNEL);
     struct cpumask *visited_pkgs = kmalloc(sizeof(struct cpumask), GFP_KERNEL);
+    if (visited_cores == NULL || visited_pkgs == NULL)
+    {
+        return;
+    }
     cpumask_clear(visited_cores);
     cpumask_clear(visited_pkgs);
 
@@ -272,6 +277,11 @@ static void calculate_cpu_topology()
 
     kfree(visited_cores);
     kfree(visited_pkgs);
+}
+
+static inline u32 get_core_id(unsigned int cpu_id)
+{
+    return topology_physical_package_id(cpu_id) * (core_num / pkg_num) + topology_core_id(cpu_id);
 }
 
 static void update_counter(struct energy_counter *counter, unsigned cpu, size_t msr_no)
@@ -303,31 +313,56 @@ static void update_counter(struct energy_counter *counter, unsigned cpu, size_t 
 static void init_timeinfos()
 {
     struct task_struct *task;
+    u32 task_num = 0;
     rcu_read_lock();
-    mutex_lock(&timeinfo_lock);
     for_each_process(task)
     {
-        struct proc_timeinfo *timeinfo = kmalloc(sizeof(struct proc_timeinfo), GFP_KERNEL);
-        if (timeinfo == NULL)
+        task_num++;
+    }
+    rcu_read_unlock();
+
+    u32 guard_num = task_num / 2;
+    struct proc_timeinfo *timeinfos = kzalloc((task_num + guard_num) * sizeof(struct proc_timeinfo), GFP_KERNEL);
+    if (timeinfos == NULL)
+    {
+        return;
+    }
+
+    u32 info_num = 0;
+    rcu_read_lock();
+    for_each_process(task)
+    {
+        timeinfos[info_num].pid = task->pid;
+        timeinfos[info_num].utime = task->utime;
+        timeinfos[info_num].stime = task->stime;
+        timeinfos[info_num].timestamp = ktime_get_ns();
+        timeinfos[info_num].core_id = get_core_id(task_cpu(task));
+        info_num++;
+        if (info_num == task_num + guard_num)
         {
-            mutex_unlock(&timeinfo_lock);
-            delete_timeinfos();
-            timeinfo_num = 0;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    if (info_num < task_num + guard_num)
+    {
+        krealloc(timeinfos, info_num * sizeof(struct proc_timeinfo), GFP_KERNEL);
+        if (timeinfos == NULL)
+        {
             return;
         }
-        timeinfo->pid = task->pid;
-        timeinfo->utime = task->utime;
-        timeinfo->stime = task->stime;
-        timeinfo->timestamp = ktime_get_ns();
-        timeinfo->cpu_ratio = 0;
-
-        timeinfo->core_id = topology_physical_package_id(task_cpu(task)) * (core_num / pkg_num) + topology_core_id(task_cpu(task));
-
-        hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
+    }
+    else
+    {
+        pr_info("Warning: The number of traversed tasks > task nums "
+                "with guard when initializing timeinfos\n");
+    }
+    for (int i = 0; i < info_num; i++)
+    {
+        hash_add(timeinfo_table, &timeinfos[i].node, timeinfos[i].pid);
         timeinfo_num++;
     }
-    mutex_unlock(&timeinfo_lock);
-    rcu_read_unlock();
 }
 
 static void update_timeinfo(struct task_struct *curr_task)
@@ -335,7 +370,7 @@ static void update_timeinfo(struct task_struct *curr_task)
     struct proc_timeinfo *timeinfo;
     mutex_lock(&timeinfo_lock);
     bool found = false;
-    hash_for_each_possible(timeinfos, timeinfo, node, curr_task->pid)
+    hash_for_each_possible(timeinfo_table, timeinfo, node, curr_task->pid)
     {
         if (timeinfo->pid == curr_task->pid)
         {
@@ -377,7 +412,7 @@ static void update_timeinfo(struct task_struct *curr_task)
         timeinfo->timestamp = ktime_get_ns();
         timeinfo->cpu_ratio = 0;
         timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
-        hash_add(timeinfos, &timeinfo->node, timeinfo->pid);
+        hash_add(timeinfo_table, &timeinfo->node, timeinfo->pid);
         timeinfo_num++;
     }
     mutex_unlock(&timeinfo_lock);
@@ -389,7 +424,7 @@ static void delete_timeinfos()
     struct hlist_node *tmp;
     int bucket;
     mutex_lock(&timeinfo_lock);
-    hash_for_each_safe(timeinfos, bucket, tmp, timeinfo, node)
+    hash_for_each_safe(timeinfo_table, bucket, tmp, timeinfo, node)
     {
         hash_del(&timeinfo->node);
         kfree(timeinfo);
@@ -720,7 +755,7 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
         rcu_read_lock();
         for_each_process(task)
         {
-            hash_for_each_possible(timeinfos, timeinfo, node, task->pid)
+            hash_for_each_possible(timeinfo_table, timeinfo, node, task->pid)
             {
                 if (timeinfo->pid == task->pid)
                 {
