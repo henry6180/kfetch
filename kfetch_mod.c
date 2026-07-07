@@ -400,6 +400,7 @@ static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
         if (timeinfo == NULL)
         {
             pr_info("Failed to allocate space of timeinfo for new process when updating timeinfo\n");
+            mutex_unlock(&timeinfo_lock);
             return;
         }
         timeinfo->pid = timeinfo_new->pid;
