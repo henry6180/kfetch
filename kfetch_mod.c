@@ -91,7 +91,7 @@ static struct task_struct *recorder;
 struct proc_powerinfo
 {
     pid_t pid;
-    char *name;
+    char name[TASK_COMM_LEN];
     u64 mw;
 };
 
@@ -323,7 +323,7 @@ static void init_timeinfos()
     rcu_read_unlock();
 
     u32 task_num_with_guard = task_num + task_num / 2;
-    struct proc_timeinfo **timeinfos = kzalloc(sizeof(struct proc_timeinfo *), GFP_KERNEL);
+    struct proc_timeinfo **timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo *), GFP_KERNEL);
     if (timeinfos == NULL)
     {
         return;
@@ -335,7 +335,7 @@ static void init_timeinfos()
         {
             for (int j = 0; j < i; j++)
             {
-                kfree(timeinfos[i]);
+                kfree(timeinfos[j]);
             }
             kfree(timeinfos);
             return;
@@ -804,7 +804,9 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 {
     ssize_t ret = 0;
     u64 *core_mws = kzalloc(core_num * sizeof(u64), GFP_KERNEL);
+    mutex_lock(&timeinfo_lock);
     struct proc_powerinfo *powerinfos = kzalloc(timeinfo_num * sizeof(struct proc_powerinfo), GFP_KERNEL);
+    mutex_unlock(&timeinfo_lock);
     if (core_mws == NULL || powerinfos == NULL)
     {
         pr_info("Failed to allocate buffer spaces when reading power info.\n");
@@ -856,10 +858,10 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
         struct proc_timeinfo *timeinfo;
         struct hlist_node *tmp;
         int bucket;
+        mutex_lock(&timeinfo_lock);
         hash_for_each_safe(timeinfo_table, bucket, tmp, timeinfo, node)
         {
             struct task_struct *task = find_task(timeinfo->pid);
-            mutex_lock(&timeinfo_lock);
             if (task == NULL)
             {
                 hash_del(&timeinfo->node);
@@ -868,13 +870,15 @@ static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
             }
             else
             {
+                rcu_read_lock();
                 powerinfos[powerinfo_num].pid = task->pid;
-                powerinfos[powerinfo_num].name = task->comm;
+                get_task_comm(powerinfos[powerinfo_num].name, task);
+                rcu_read_unlock();
                 powerinfos[powerinfo_num].mw = core_mws[timeinfo->core_id] * timeinfo->cpu_ratio / 1000;
                 powerinfo_num++;
             }
-            mutex_unlock(&timeinfo_lock);
         }
+        mutex_unlock(&timeinfo_lock);
         sort(powerinfos, powerinfo_num, sizeof(struct proc_powerinfo), compare_power, NULL);
 
         snprintf(buf, KFETCH_INFO_SIZE, "pid\tprocess name\twatt(mw)\n");
@@ -904,7 +908,7 @@ static ssize_t kfetch_read(struct file *filp, char __user *buffer, size_t length
         return 0;
     }
     ssize_t ret = 0;
-    char *kfetch_buf = kmalloc(KFETCH_BUF_SIZE * sizeof(char), GFP_KERNEL);
+    char *kfetch_buf = kzalloc(KFETCH_BUF_SIZE * sizeof(char), GFP_KERNEL);
     if (kfetch_buf == NULL)
     {
         ret = -1;
