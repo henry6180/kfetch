@@ -101,7 +101,7 @@ static void calculate_cpu_topology(void);
 static inline u32 get_core_id(unsigned int);
 static void update_counter(struct energy_counter *, unsigned, size_t);
 static void init_timeinfos(void);
-static void update_timeinfo(struct task_struct *);
+static void update_timeinfo(struct proc_timeinfo *, u64);
 static void delete_timeinfos(void);
 static int compare_power(const void *, const void *);
 static int kfetch_record_runtime(void *);
@@ -321,8 +321,8 @@ static void init_timeinfos()
     }
     rcu_read_unlock();
 
-    u32 guard_num = task_num / 2;
-    struct proc_timeinfo *timeinfos = kzalloc((task_num + guard_num) * sizeof(struct proc_timeinfo), GFP_KERNEL);
+    u32 task_num_with_guard = task_num + task_num / 2;
+    struct proc_timeinfo *timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
     if (timeinfos == NULL)
     {
         return;
@@ -338,14 +338,14 @@ static void init_timeinfos()
         timeinfos[info_num].timestamp = ktime_get_ns();
         timeinfos[info_num].core_id = get_core_id(task_cpu(task));
         info_num++;
-        if (info_num == task_num + guard_num)
+        if (info_num == task_num_with_guard)
         {
             break;
         }
     }
     rcu_read_unlock();
 
-    if (info_num < task_num + guard_num)
+    if (info_num < task_num_with_guard)
     {
         krealloc(timeinfos, info_num * sizeof(struct proc_timeinfo), GFP_KERNEL);
         if (timeinfos == NULL)
@@ -365,57 +365,63 @@ static void init_timeinfos()
     }
 }
 
-static void update_timeinfo(struct task_struct *curr_task)
+static void update_timeinfo(struct proc_timeinfo *timeinfo_new, u64 boottime)
 {
-    struct proc_timeinfo *timeinfo;
+    // Find the old timeinfo
+    struct proc_timeinfo *timeinfo = NULL;
+    struct proc_timeinfo *temp;
     mutex_lock(&timeinfo_lock);
-    bool found = false;
-    hash_for_each_possible(timeinfo_table, timeinfo, node, curr_task->pid)
+    hash_for_each_possible(timeinfo_table, temp, node, timeinfo_new->pid)
     {
-        if (timeinfo->pid == curr_task->pid)
+        if (temp->pid == timeinfo_new->pid)
         {
-            struct proc_timeinfo old = *timeinfo;
-            timeinfo->utime = curr_task->utime;
-            timeinfo->stime = curr_task->stime;
-            timeinfo->timestamp = ktime_get_ns();
-            timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
-            // the process is recreated
-            if (curr_task->start_boottime > old.timestamp)
-            {
-                timeinfo->cpu_ratio = 0;
-            }
-            else
-            {
-                u64 utime_diff = timeinfo->utime - old.utime;                             // ns
-                u64 stime_diff = timeinfo->stime - old.stime;                             // ns
-                u64 time_diff_us = div64_ul(timeinfo->timestamp - old.timestamp, 1000UL); // us
-                timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us);   // [0 ~ 1000]
-            }
-            found = true;
+            timeinfo = temp;
             break;
         }
     }
-    // the process is newly created
-    if (!found)
+    mutex_unlock(&timeinfo_lock);
+
+    // The task is newly created.
+    if (timeinfo == NULL)
     {
-        struct proc_timeinfo *timeinfo = kmalloc(sizeof(struct proc_timeinfo), GFP_KERNEL);
+        timeinfo = kzalloc(sizeof(struct proc_timeinfo), GFP_KERNEL);
         if (timeinfo == NULL)
         {
-            mutex_unlock(&timeinfo_lock);
-            delete_timeinfos();
-            timeinfo_num = 0;
+            pr_info("Failed to allocate space of timeinfo for new process when updating timeinfo\n");
             return;
         }
-        timeinfo->pid = curr_task->pid;
-        timeinfo->utime = curr_task->utime;
-        timeinfo->stime = curr_task->stime;
-        timeinfo->timestamp = ktime_get_ns();
-        timeinfo->cpu_ratio = 0;
-        timeinfo->core_id = topology_physical_package_id(task_cpu(curr_task)) * (core_num / pkg_num) + topology_core_id(task_cpu(curr_task));
+        timeinfo->pid = timeinfo_new->pid;
+        timeinfo->utime = timeinfo_new->utime;
+        timeinfo->stime = timeinfo_new->stime;
+        timeinfo->timestamp = timeinfo_new->timestamp;
+        timeinfo->core_id = timeinfo_new->core_id;
+        mutex_lock(&timeinfo_lock);
         hash_add(timeinfo_table, &timeinfo->node, timeinfo->pid);
         timeinfo_num++;
+        mutex_unlock(&timeinfo_lock);
     }
-    mutex_unlock(&timeinfo_lock);
+    else
+    {
+        mutex_lock(&timeinfo_lock);
+        struct proc_timeinfo timeinfo_old = *timeinfo;
+        timeinfo->utime = timeinfo_new->utime;
+        timeinfo->stime = timeinfo_new->stime;
+        timeinfo->timestamp = timeinfo_new->timestamp;
+        timeinfo->core_id = timeinfo_new->core_id;
+        // the pid is reused by another task
+        if (boottime > timeinfo_old.timestamp)
+        {
+            timeinfo->cpu_ratio = 0;
+        }
+        else
+        {
+            u64 utime_diff = timeinfo->utime - timeinfo_old.utime;                             // ns
+            u64 stime_diff = timeinfo->stime - timeinfo_old.stime;                             // ns
+            u64 time_diff_us = div64_ul(timeinfo->timestamp - timeinfo_old.timestamp, 1000UL); // us
+            timeinfo->cpu_ratio = div64_u64(utime_diff + stime_diff, time_diff_us);            // [0 ~ 1000]
+        }
+        mutex_unlock(&timeinfo_lock);
+    }
 }
 
 static void delete_timeinfos()
@@ -450,20 +456,57 @@ static int compare_power(const void *lhs, const void *rhs)
 static int kfetch_record_runtime(void *args)
 {
     pr_info("kfetch_record_runtime is running.\n");
+    struct proc_timeinfo *timeinfos = NULL;
+    u64 *boottimes = NULL;
     while (!kthread_should_stop())
     {
+        // Read the number of tasks and realloc buffer spaces
         struct task_struct *task;
+        u32 task_num = 0;
         rcu_read_lock();
         for_each_process(task)
         {
-            update_timeinfo(task);
-            if (timeinfo_num == 0)
-            {
-                pr_info("Failed to update the hash table of timeinfos\n");
-                return -1;
-            }
+            task_num++;
         }
         rcu_read_unlock();
+        u32 task_num_with_guard = task_num + task_num / 2;
+        if (timeinfos == NULL || boottimes == NULL)
+        {
+            timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
+            boottimes = kzalloc(task_num_with_guard * sizeof(u64), GFP_KERNEL);
+        }
+        else
+        {
+            krealloc(timeinfos, task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
+            krealloc(boottimes, task_num_with_guard * sizeof(u64), GFP_KERNEL);
+        }
+
+        if (timeinfos != NULL && boottimes != NULL)
+        {
+            // Store task informations in the buffers
+            u32 info_num = 0;
+            rcu_read_lock();
+            for_each_process(task)
+            {
+                timeinfos[info_num].pid = task->pid;
+                timeinfos[info_num].utime = task->utime;
+                timeinfos[info_num].stime = task->stime;
+                timeinfos[info_num].timestamp = ktime_get_ns();
+                timeinfos[info_num].core_id = get_core_id(task_cpu(task));
+                boottimes[info_num] = task->start_boottime;
+                info_num++;
+                if (info_num == task_num_with_guard)
+                {
+                    break;
+                }
+            }
+            rcu_read_unlock();
+
+            for (int i = 0; i < info_num; i++)
+            {
+                update_timeinfo(timeinfos + i, boottimes[i]);
+            }
+        }
 
         if (kthread_should_stop())
         {
@@ -472,6 +515,8 @@ static int kfetch_record_runtime(void *args)
 
         msleep_interruptible(record_rate_ms);
     }
+    kfree(timeinfos);
+    kfree(boottimes);
     return 0;
 }
 
