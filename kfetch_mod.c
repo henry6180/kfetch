@@ -25,7 +25,7 @@
 
 #define KFETCH_DEV_NAME "kfetch"
 #define KFETCH_BUF_SIZE 2048
-#define KFETCH_INFO_SIZE 128
+#define KFETCH_INFO_SIZE 80
 #define KFETCH_DEV_NUM 1
 #define CLOSED 0
 #define OPENING 1
@@ -91,7 +91,7 @@ static struct task_struct *recorder;
 struct proc_powerinfo
 {
     pid_t pid;
-    char name[TASK_COMM_LEN];
+    char *name;
     u64 mw;
 };
 
@@ -103,6 +103,7 @@ static void update_counter(struct energy_counter *, unsigned, size_t);
 static void init_timeinfos(void);
 static void update_timeinfo(struct proc_timeinfo *, u64);
 static void delete_timeinfos(void);
+static struct task_struct *find_task(pid_t);
 static int compare_power(const void *, const void *);
 static int kfetch_record_runtime(void *);
 static int kfetch_calculate_power(void *);
@@ -322,21 +323,34 @@ static void init_timeinfos()
     rcu_read_unlock();
 
     u32 task_num_with_guard = task_num + task_num / 2;
-    struct proc_timeinfo *timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
+    struct proc_timeinfo **timeinfos = kzalloc(sizeof(struct proc_timeinfo *), GFP_KERNEL);
     if (timeinfos == NULL)
     {
         return;
+    }
+    for (int i = 0; i < task_num_with_guard; i++)
+    {
+        timeinfos[i] = kzalloc(sizeof(struct proc_timeinfo), GFP_KERNEL);
+        if (timeinfos[i] == NULL)
+        {
+            for (int j = 0; j < i; j++)
+            {
+                kfree(timeinfos[i]);
+            }
+            kfree(timeinfos);
+            return;
+        }
     }
 
     u32 info_num = 0;
     rcu_read_lock();
     for_each_process(task)
     {
-        timeinfos[info_num].pid = task->pid;
-        timeinfos[info_num].utime = task->utime;
-        timeinfos[info_num].stime = task->stime;
-        timeinfos[info_num].timestamp = ktime_get_ns();
-        timeinfos[info_num].core_id = get_core_id(task_cpu(task));
+        timeinfos[info_num]->pid = task->pid;
+        timeinfos[info_num]->utime = task->utime;
+        timeinfos[info_num]->stime = task->stime;
+        timeinfos[info_num]->timestamp = ktime_get_ns();
+        timeinfos[info_num]->core_id = get_core_id(task_cpu(task));
         info_num++;
         if (info_num == task_num_with_guard)
         {
@@ -347,10 +361,9 @@ static void init_timeinfos()
 
     if (info_num < task_num_with_guard)
     {
-        krealloc(timeinfos, info_num * sizeof(struct proc_timeinfo), GFP_KERNEL);
-        if (timeinfos == NULL)
+        for (int i = info_num; i < task_num_with_guard; i++)
         {
-            return;
+            kfree(timeinfos[i]);
         }
     }
     else
@@ -360,7 +373,7 @@ static void init_timeinfos()
     }
     for (int i = 0; i < info_num; i++)
     {
-        hash_add(timeinfo_table, &timeinfos[i].node, timeinfos[i].pid);
+        hash_add(timeinfo_table, &timeinfos[i]->node, timeinfos[i]->pid);
         timeinfo_num++;
     }
 }
@@ -438,6 +451,23 @@ static void delete_timeinfos()
     mutex_unlock(&timeinfo_lock);
 }
 
+static struct task_struct *find_task(pid_t pid)
+{
+    rcu_read_lock();
+    struct task_struct *ret = NULL;
+    struct task_struct *task;
+    for_each_process(task)
+    {
+        if (task->pid == pid)
+        {
+            ret = task;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
 static int compare_power(const void *lhs, const void *rhs)
 {
     const struct proc_powerinfo *powerinfo_lhs = (const struct proc_powerinfo *)lhs;
@@ -457,6 +487,7 @@ static int kfetch_record_runtime(void *args)
 {
     pr_info("kfetch_record_runtime is running.\n");
     struct proc_timeinfo *timeinfos = NULL;
+    u32 current_num = 0;
     u64 *boottimes = NULL;
     while (!kthread_should_stop())
     {
@@ -474,11 +505,27 @@ static int kfetch_record_runtime(void *args)
         {
             timeinfos = kzalloc(task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
             boottimes = kzalloc(task_num_with_guard * sizeof(u64), GFP_KERNEL);
+            if(timeinfos != NULL && boottimes != NULL)
+            {
+                current_num = task_num_with_guard;
+            }
         }
         else
         {
-            krealloc(timeinfos, task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
-            krealloc(boottimes, task_num_with_guard * sizeof(u64), GFP_KERNEL);
+            struct proc_timeinfo *temp_infos = krealloc(timeinfos, task_num_with_guard * sizeof(struct proc_timeinfo), GFP_KERNEL);
+            u64 *temp_boottimes = krealloc(boottimes, task_num_with_guard * sizeof(u64), GFP_KERNEL);
+            if(temp_infos != NULL)
+            {
+                timeinfos = temp_infos;
+            }
+            if(temp_boottimes != NULL)
+            {
+                boottimes = temp_boottimes;
+            }
+            if(temp_infos != NULL && temp_boottimes != NULL)
+            {
+                current_num = task_num_with_guard;
+            }
         }
 
         if (timeinfos != NULL && boottimes != NULL)
@@ -495,7 +542,7 @@ static int kfetch_record_runtime(void *args)
                 timeinfos[info_num].core_id = get_core_id(task_cpu(task));
                 boottimes[info_num] = task->start_boottime;
                 info_num++;
-                if (info_num == task_num_with_guard)
+                if (info_num == current_num)
                 {
                     break;
                 }
@@ -523,17 +570,21 @@ static int kfetch_record_runtime(void *args)
 static int kfetch_calculate_power(void *args)
 {
     pr_info("kfetch_calculate_power is running.\n");
-    unsigned long long *copy = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
+    u64 pkg_sum = 0;
+    u64 *copy = kzalloc(core_num * sizeof(u64), GFP_KERNEL);
+    if (copy == NULL)
+    {
+        pr_info("Failed to allocate buffer spaces in kfetch_calculate_power.\n");
+        return -1;
+    }
     while (!kthread_should_stop())
     {
-        unsigned long long pkg_sum = 0;
+        // Record counters into buffers
+        pkg_sum = 0;
         mutex_lock(&counter_lock);
         for (int i = 0; i < core_num; i++)
         {
-            if (cpu_online(i))
-            {
-                copy[i] = counters_core[i].curr;
-            }
+            copy[i] = (cpu_online(i)) ? counters_core[i].curr : 0;
         }
         for (int i = 0; i < pkg_num; i++)
         {
@@ -541,6 +592,7 @@ static int kfetch_calculate_power(void *args)
         }
         mutex_unlock(&counter_lock);
 
+        // Calculate energy consumed by cores and packages
         mutex_lock(&joule_lock);
         for (int i = 0; i < core_num; i++)
         {
@@ -548,6 +600,11 @@ static int kfetch_calculate_power(void *args)
             {
                 core_uj[i][0] = core_uj[i][1];
                 core_uj[i][1] = div64_ul(copy[i] * 1000000UL, BIT(energy_unit));
+            }
+            else
+            {
+                core_uj[i][0] = 0;
+                core_uj[i][1] = 0;
             }
         }
         pkg_uj[0] = pkg_uj[1];
@@ -571,7 +628,7 @@ static int kfetch_accumulate_energy(void *args)
     while (!kthread_should_stop())
     {
         // core
-        for (unsigned cpu = 0; cpu < core_num; cpu++)
+        for (int cpu = 0; cpu < core_num; cpu++)
         {
             if (cpu_online(cpu))
             {
@@ -579,7 +636,7 @@ static int kfetch_accumulate_energy(void *args)
             }
         }
         // package
-        for (unsigned pkg = 0; pkg < pkg_num; pkg++)
+        for (int pkg = 0; pkg < pkg_num; pkg++)
         {
             unsigned cpu = cpumask_first_and(
                 cpu_online_mask,
@@ -745,89 +802,99 @@ cleanup:
 
 static ssize_t kfetch_read_power_info(char *buffer, size_t buffer_size)
 {
-    if (((mask >> 6) & 1) == 0)
+    ssize_t ret = 0;
+    u64 *core_mws = kzalloc(core_num * sizeof(u64), GFP_KERNEL);
+    struct proc_powerinfo *powerinfos = kzalloc(timeinfo_num * sizeof(struct proc_powerinfo), GFP_KERNEL);
+    if (core_mws == NULL || powerinfos == NULL)
     {
+        pr_info("Failed to allocate buffer spaces when reading power info.\n");
         return strlen(buffer);
     }
 
-    size_t sep_len = 64;
+    char buf[KFETCH_INFO_SIZE] = "";
     char separate_line[KFETCH_INFO_SIZE] = "";
-    memset(separate_line, '=', sep_len - 1);
-    separate_line[sep_len - 1] = '\n';
-    separate_line[sep_len] = '\0';
+    memset(separate_line, '=', KFETCH_INFO_SIZE - 2);
+    separate_line[KFETCH_INFO_SIZE - 2] = '\n';
+    separate_line[KFETCH_INFO_SIZE - 1] = '\0';
+    strncat(buffer, separate_line, buffer_size - strlen(buffer) - 1);
 
-    mutex_lock(&joule_lock);
-    unsigned long long pkg_mw = div64_ul(pkg_uj[1] - pkg_uj[0], calculate_rate_ms);
-    unsigned long long *core_mws = kmalloc(core_num * sizeof(unsigned long long), GFP_KERNEL);
-    unsigned long long core_mw = 0;
-    for (int i = 0; i < core_num; i++)
+    if ((mask >> 6) & 1)
     {
-        if (cpu_online(i))
+        mutex_lock(&joule_lock);
+        u64 core_mw = 0;
+        u64 pkg_mw = div64_ul(pkg_uj[1] - pkg_uj[0], calculate_rate_ms);
+        for (int i = 0; i < core_num; i++)
         {
-            core_mws[i] = div64_ul(core_uj[i][1] - core_uj[i][0], calculate_rate_ms);
-            core_mw += core_mws[i];
+            if (cpu_online(i))
+            {
+                core_mws[i] = div64_ul(core_uj[i][1] - core_uj[i][0], calculate_rate_ms);
+                core_mw += core_mws[i];
+            }
+        }
+        mutex_unlock(&joule_lock);
+        if (core_mw > __LONG_LONG_MAX__ || pkg_mw > __LONG_LONG_MAX__)
+        {
+            pr_info("Power of cpu cores or packages overflow\n");
+            ret = -1;
+            goto cleanup;
+        }
+
+        if (core_mw == 0 || pkg_mw == 0)
+        {
+            snprintf(buf, KFETCH_INFO_SIZE, "Power of cpu cores or packages == 0.\n");
         }
         else
         {
-            core_mws[i] = 0;
+            snprintf(buf, KFETCH_INFO_SIZE, "pkg power: %llumW\tcore power: %llumW.\n", pkg_mw, core_mw);
         }
-    }
-    mutex_unlock(&joule_lock);
-    if (core_mw > __LONG_LONG_MAX__ || pkg_mw > __LONG_LONG_MAX__)
-    {
-        pr_info("Power of cpu cores or packages overflow\n");
-        kfree(core_mws);
-        return -1;
-    }
 
-    if (core_mw == 0 || pkg_mw == 0)
-    {
-        snprintf(buffer, buffer_size, "%sPower of cpu cores or packages == 0.\n", separate_line);
+        strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
     }
-    else
-    {
-        snprintf(buffer, buffer_size,
-                 "%spkg power: %llumW\tcore power: %llumW.\n",
-                 separate_line, pkg_mw, core_mw);
-    }
-
     if ((mask >> 7) & 1)
     {
-        struct task_struct *task;
+        u32 powerinfo_num = 0;
         struct proc_timeinfo *timeinfo;
-        struct proc_powerinfo *powerinfos = kmalloc(timeinfo_num * sizeof(struct proc_powerinfo), GFP_KERNEL);
-        int count = 0;
-        rcu_read_lock();
-        for_each_process(task)
+        struct hlist_node *tmp;
+        int bucket;
+        hash_for_each_safe(timeinfo_table, bucket, tmp, timeinfo, node)
         {
-            hash_for_each_possible(timeinfo_table, timeinfo, node, task->pid)
+            struct task_struct *task = find_task(timeinfo->pid);
+            mutex_lock(&timeinfo_lock);
+            if (task == NULL)
             {
-                if (timeinfo->pid == task->pid)
-                {
-                    powerinfos[count].pid = task->pid;
-                    get_task_comm(powerinfos[count].name, task);
-                    powerinfos[count].mw = core_mws[timeinfo->core_id] * timeinfo->cpu_ratio / 1000;
-                    count++;
-                    break;
-                }
+                hash_del(&timeinfo->node);
+                kfree(timeinfo);
+                timeinfo_num--;
             }
+            else
+            {
+                powerinfos[powerinfo_num].pid = task->pid;
+                powerinfos[powerinfo_num].name = task->comm;
+                powerinfos[powerinfo_num].mw = core_mws[timeinfo->core_id] * timeinfo->cpu_ratio / 1000;
+                powerinfo_num++;
+            }
+            mutex_unlock(&timeinfo_lock);
         }
-        rcu_read_unlock();
-        sort(powerinfos, count, sizeof(struct proc_powerinfo), compare_power, NULL);
-        char buf[KFETCH_INFO_SIZE] = "";
-        strncat(buffer, "pid\tprocess name\twatt(mw)\n", buffer_size - strlen(buffer) - 1);
-        for (int i = 0; i < min(10, count) && powerinfos[i].mw; i++)
+        sort(powerinfos, powerinfo_num, sizeof(struct proc_powerinfo), compare_power, NULL);
+
+        snprintf(buf, KFETCH_INFO_SIZE, "pid\tprocess name\twatt(mw)\n");
+        strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
+        for (int i = 0; i < min(10, powerinfo_num) && powerinfos[i].mw; i++)
         {
             snprintf(buf, KFETCH_INFO_SIZE, "%d\t%-*s%llu\n", powerinfos[i].pid,
-                     TASK_COMM_LEN, powerinfos[i].name,
-                     powerinfos[i].mw);
+                     TASK_COMM_LEN, powerinfos[i].name, powerinfos[i].mw);
             strncat(buffer, buf, buffer_size - strlen(buffer) - 1);
         }
-        strncat(buffer, separate_line, buffer_size - sep_len - 1);
-        kfree(powerinfos);
     }
 
-    return strlen(buffer);
+    strncat(buffer, separate_line, buffer_size - strlen(buffer) - 1);
+    ret = strlen(buffer);
+
+cleanup:
+    kfree(core_mws);
+    kfree(powerinfos);
+
+    return ret;
 }
 
 static ssize_t kfetch_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
